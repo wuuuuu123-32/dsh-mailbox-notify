@@ -1,0 +1,12 @@
+# dsh-mailbox-notify —— 只挂一行：任务结束时发通知到你手机
+#
+# 配置写在 ~/.dsh/mailbox-notify.json（推荐），或在这里用 config 覆盖。
+# 完整配置项见 README.md 和 config.example.json。
+- insert:
+    - id: dsh-mailbox-notify
+      name: dsh-mailbox-notify
+      # config:
+      #   channel: mail          # mail | ntfy | both
+      #   notifyOn: goals        # errors | goals | all
+      #   longTaskMs: 300000
+      #   cleanupOld: true

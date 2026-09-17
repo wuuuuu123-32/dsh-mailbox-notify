@@ -1,0 +1,66 @@
+{
+  "name": "dsh-mailbox-notify",
+  "version": "1.0.0",
+  "description": "DeepSeek Harness (dsh) 任务完成邮件通知：任务跑完自动发邮件到你手机，并且每封新通知会自动删掉上一封（邮箱永不堆积）。零依赖、零构建、不监听端口。",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek",
+    "harness",
+    "cordis",
+    "plugin",
+    "notify",
+    "notification",
+    "email",
+    "smtp",
+    "imap",
+    "ntfy"
+  ],
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "config.example.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dshhub": {
+    "schemaVersion": 1,
+    "displayName": "dsh-mailbox-notify",
+    "summary": "任务完成时发邮件到你手机，并自动删除上一封通知（邮箱永不堆积）。零依赖，支持 QQ/163/Gmail 等任意 SMTP 邮箱，可选 ntfy。",
+    "categories": [
+      "通知",
+      "Host",
+      "效率"
+    ],
+    "surfaces": [
+      "host"
+    ],
+    "capabilities": {
+      "provides": [
+        "mailbox-notify"
+      ]
+    },
+    "compatibility": {
+      "dsh": ">=0.1.0-rc.5",
+      "node": ">=20"
+    },
+    "permissions": {
+      "network": [
+        "用户自配的 SMTP 服务器(发信)",
+        "用户自配的 IMAP 服务器(清理旧通知)",
+        "ntfy.sh(可选通道)"
+      ]
+    }
+  }
+}

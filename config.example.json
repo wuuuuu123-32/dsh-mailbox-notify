@@ -1,0 +1,26 @@
+{
+  "channel": "mail",
+  "notifyOn": "goals",
+  "longTaskMs": 300000,
+  "debounceMs": 60000,
+  "cleanupOld": true,
+  "mailTag": "[dsh-notify]",
+
+  "mail": {
+    "host": "smtp.qq.com",
+    "port": 465,
+    "user": "你的邮箱@qq.com",
+    "pass": "你的SMTP授权码（不是登录密码）",
+    "to": "你的邮箱@qq.com"
+  },
+
+  "imap": {
+    "host": "imap.qq.com",
+    "port": 993
+  },
+
+  "ntfy": {
+    "topic": "",
+    "server": "https://ntfy.sh"
+  }
+}

@@ -1,0 +1,11 @@
+# node_modules / 依赖
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# 真实配置：含邮箱授权码，绝不入库
+config.json
+
+# 测试产物 / 临时文件
+*.log
+_tmp_*
