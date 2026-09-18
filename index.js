@@ -32,7 +32,8 @@ export const inject = []
 const DEFAULTS = {
   channel: 'mail',
   notifyOn: 'goals',
-  longTaskMs: 300000, // notifyOn=goals 时，耗时超过 5 分钟的轮次也算正经任务
+  longTaskMs: 180000, // 判据①：耗时超过这个数（默认 3 分钟）算"正经干活"
+  minToolCalls: 5, // 判据②：一轮里工具调用 ≥ 这个数（默认 5 次）也算 —— **不依赖 agent 建 goal**
   debounceMs: 60000, // 连续成功通知的合并窗口，防止刷屏
   cleanupOld: true, // 发新通知前删掉旧的同前缀通知（邮箱不堆积）
   mailTag: '[dsh-notify]', // 通知邮件的主题前缀，IMAP 靠它识别"自己的邮件"
@@ -106,6 +107,7 @@ function resolveConfig(cliConfig = {}) {
     channel: String(pick(env.DSH_NOTIFY_CHANNEL, cliConfig.channel, file.channel, DEFAULTS.channel)),
     notifyOn: ['errors', 'goals', 'all'].includes(notifyOn) ? notifyOn : DEFAULTS.notifyOn,
     longTaskMs: toInt(pick(env.DSH_NOTIFY_LONG_MS, cliConfig.longTaskMs, file.longTaskMs), DEFAULTS.longTaskMs),
+    minToolCalls: toInt(pick(env.DSH_NOTIFY_MIN_TOOLS, cliConfig.minToolCalls, file.minToolCalls), DEFAULTS.minToolCalls),
     debounceMs: toInt(pick(env.DSH_NOTIFY_DEBOUNCE_MS, cliConfig.debounceMs, file.debounceMs), DEFAULTS.debounceMs),
     cleanupOld: toBool(pick(env.DSH_NOTIFY_CLEANUP_OLD, cliConfig.cleanupOld, file.cleanupOld), DEFAULTS.cleanupOld),
     mailTag: String(pick(env.DSH_NOTIFY_MAIL_TAG, cliConfig.mailTag, file.mailTag, DEFAULTS.mailTag)),
@@ -151,6 +153,27 @@ function clip(text, max = 90) {
   const flat = String(text ?? '').replace(/\s+/g, ' ').trim()
   if (flat === '') return ''
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`
+}
+
+/**
+ * 统计某一轮里的工具调用次数与工具名。
+ * 事件结构：'tool/call': { turn, step, callId, name, arguments }
+ * 这是"这一轮到底干了多少活"最客观的判据 —— 不依赖 agent 有没有建 goal。
+ * @param session - 会话对象（含 events 数组）
+ * @param turn - 轮次编号
+ * @returns { count, names }
+ */
+function toolStats(session, turn) {
+  const events = session?.events
+  if (!Array.isArray(events)) return { count: 0, names: [] }
+  const names = []
+  let inTurn = false
+  for (const e of events) {
+    if (e?.type === 'turn/start' && e?.data?.turn === turn) { inTurn = true; continue }
+    if (e?.type === 'turn/end' && e?.data?.turn === turn) break
+    if (inTurn && e?.type === 'tool/call' && typeof e.data?.name === 'string') names.push(e.data.name)
+  }
+  return { count: names.length, names }
 }
 
 /** 取本轮任务的用户原文作为通知摘要。 */
@@ -437,14 +460,17 @@ export function apply(ctx, cliConfig = {}) {
       const meta = KINDS[kind]
       if (meta === undefined) return
 
+      const stats = toolStats(session, event.data?.turn)
+
       if (kind === 'completed') {
         if (cfg.notifyOn === 'errors') return
-        // goals 模式下，只有干得够久、像是"正经干活"的轮次才推
-        const longEnough = cfg.notifyOn === 'all' || durationMs >= cfg.longTaskMs
-        if (!longEnough) return
+        // 两个**客观**判据，都不依赖 agent 是否建了 goal：
+        //   ① 这一轮干得够久（longTaskMs）  ② 这一轮动手够多（工具调用次数）
+        if (cfg.notifyOn !== 'all' && durationMs < cfg.longTaskMs && stats.count < cfg.minToolCalls) return
       }
 
       const lines = [taskSnippet(session, event.data?.turn)]
+      if (stats.count > 0) lines.push(`调用了 ${stats.count} 次工具`)
       if (durationMs >= 1000) lines.push(`用时 ${formatDuration(durationMs)}`)
       if (kind === 'error') {
         const err = event.data?.reason?.error ?? {}
@@ -460,7 +486,7 @@ export function apply(ctx, cliConfig = {}) {
   const target = [useMail ? `邮件 ${cfg.mail.to}` : '', useNtfy ? `ntfy ${cfg.ntfy.topic}` : ''].filter(Boolean).join(' + ')
   const policy = {
     errors: '仅异常',
-    goals: `目标完成 / 异常 / 超 ${Math.round(cfg.longTaskMs / 60000)} 分钟的长任务`,
+    goals: `目标完成 / 异常 / 超 ${Math.round(cfg.longTaskMs / 60000)} 分钟 或 工具调用 ≥ ${cfg.minToolCalls} 次的轮次`,
     all: '每轮都推',
   }[cfg.notifyOn]
   console.log(
