@@ -1,10 +1,15 @@
 {
   "channel": "mail",
   "notifyOn": "goals",
-  "longTaskMs": 300000,
+  "longTaskMs": 180000,
+  "minToolCalls": 5,
   "debounceMs": 60000,
   "cleanupOld": true,
   "mailTag": "[dsh-notify]",
+
+  "approvalTimeoutMs": 60000,
+  "approvalIncludeSubagents": true,
+  "link": "",
 
   "mail": {
     "host": "smtp.qq.com",

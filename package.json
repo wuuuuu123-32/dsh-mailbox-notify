@@ -1,7 +1,7 @@
 {
   "name": "dsh-mailbox-notify",
-  "version": "1.0.0",
-  "description": "DeepSeek Harness (dsh) 任务完成邮件通知：任务跑完自动发邮件到你手机，并且每封新通知会自动删掉上一封（邮箱永不堆积）。零依赖、零构建、不监听端口。",
+  "version": "1.1.0",
+  "description": "DeepSeek Harness (dsh) 任务通知：任务跑完自动发邮件到你手机，审批卡住超过 1 分钟也会提醒你，并且每封新通知会自动删掉上一封（邮箱永不堆积）。零依赖、零构建、不监听端口。",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -14,6 +14,7 @@
     "plugin",
     "notify",
     "notification",
+    "approval",
     "email",
     "smtp",
     "imap",
@@ -37,7 +38,7 @@
   "dshhub": {
     "schemaVersion": 1,
     "displayName": "dsh-mailbox-notify",
-    "summary": "任务完成时发邮件到你手机，并自动删除上一封通知（邮箱永不堆积）。零依赖，支持 QQ/163/Gmail 等任意 SMTP 邮箱，可选 ntfy。",
+    "summary": "任务完成 / 审批超时发邮件到你手机，并自动删除上一封通知（邮箱永不堆积）。通知带会话标题，多对话并行也能分辨；支持 QQ/163/Gmail 等任意 SMTP 邮箱，可选 ntfy。",
     "categories": [
       "通知",
       "Host",

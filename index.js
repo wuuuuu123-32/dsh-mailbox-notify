@@ -6,6 +6,19 @@
  *   'goals'   异常 + 目标完成 + 超长任务（默认，推荐）
  *   'all'     每一轮回答结束都推（最吵）
  *
+ * 审批超时提醒（approvalTimeoutMs，默认 60 秒；**独立于 notifyOn**）：
+ *   agent 弹出权限审批后如果一直没人点，任务就卡在那儿不动。等超过
+ *   approvalTimeoutMs 还没被回答的审批，会单独发一封提醒，告诉你
+ *   "哪个会话、在等你批准什么操作、已经等了多久"。
+ *   判据是会话日志里成对的 approval/asked → approval/decided 事件：
+ *   前者在开始等待用户之前写入，后者在用户作答之后写入 —— 两者之差
+ *   就是真实等待时长，完全不用碰审批链本身（也就绝不会替用户做决定）。
+ *   同一批（3 秒内）超时的多个审批合并成一封；每个请求只提醒一次。
+ *
+ * 通知里怎么认出"是哪个任务"（多对话并行时）：
+ *   每条通知都带会话标题（session/title 事件）、会话号（id 前 8 位）
+ *   和所属工作区（cwd）；主题里也带一小段标题，手机邮件列表就能分辨。
+ *
  * 通道（channel）：
  *   'mail'  用你自己的邮箱（SMTP）发通知邮件，不需要 VPN
  *   'ntfy'  POST 到 ntfy.sh，秒到，但国内需要能连 Google 推送 / VPN
@@ -37,18 +50,25 @@ const DEFAULTS = {
   debounceMs: 60000, // 连续成功通知的合并窗口，防止刷屏
   cleanupOld: true, // 发新通知前删掉旧的同前缀通知（邮箱不堆积）
   mailTag: '[dsh-notify]', // 通知邮件的主题前缀，IMAP 靠它识别"自己的邮件"
+  approvalTimeoutMs: 60000, // 审批挂起超过这个时间就提醒；0 = 关掉审批提醒
+  approvalIncludeSubagents: true, // 子代理的审批同样会卡住整个任务，默认一并提醒
+  link: '', // 邮件里附带回 DSH 的链接（如 Tailscale 地址），手机点开直接去点审批
   mail: { host: '', port: 465, user: '', pass: '', to: '' },
   imap: { host: 'imap.qq.com', port: 993 },
   ntfy: { topic: '', server: 'https://ntfy.sh' },
   timeoutMs: 25000,
 }
 
+/** 同时超时的多个审批合并进同一封邮件的等待窗口。 */
+const APPROVAL_MERGE_MS = 3000
+
 const KINDS = {
-  completed: { title: '✅ 任务完成', tag: 'white_check_mark', priority: 'default' },
-  'goal-completed': { title: '🎯 目标完成', tag: 'tada', priority: 'default' },
-  'goal-blocked': { title: '⚠️ 目标受阻', tag: 'warning', priority: 'high' },
-  error: { title: '❌ 任务出错', tag: 'rotating_light', priority: 'high' },
-  aborted: { title: '⚠️ 任务中断', tag: 'warning', priority: 'high' },
+  approval: { title: '🔐 等你审批', short: '🔐 等审批', tag: 'lock', priority: 'high' },
+  completed: { title: '✅ 任务完成', short: '✅ 完成', tag: 'white_check_mark', priority: 'default' },
+  'goal-completed': { title: '🎯 目标完成', short: '🎯 目标完成', tag: 'tada', priority: 'default' },
+  'goal-blocked': { title: '⚠️ 目标受阻', short: '⚠️ 目标受阻', tag: 'warning', priority: 'high' },
+  error: { title: '❌ 任务出错', short: '❌ 出错', tag: 'rotating_light', priority: 'high' },
+  aborted: { title: '⚠️ 任务中断', short: '⚠️ 中断', tag: 'warning', priority: 'high' },
 }
 
 /* ---------------------------------- 配置 ---------------------------------- */
@@ -111,6 +131,15 @@ function resolveConfig(cliConfig = {}) {
     debounceMs: toInt(pick(env.DSH_NOTIFY_DEBOUNCE_MS, cliConfig.debounceMs, file.debounceMs), DEFAULTS.debounceMs),
     cleanupOld: toBool(pick(env.DSH_NOTIFY_CLEANUP_OLD, cliConfig.cleanupOld, file.cleanupOld), DEFAULTS.cleanupOld),
     mailTag: String(pick(env.DSH_NOTIFY_MAIL_TAG, cliConfig.mailTag, file.mailTag, DEFAULTS.mailTag)),
+    approvalTimeoutMs: toInt(
+      pick(env.DSH_NOTIFY_APPROVAL_MS, cliConfig.approvalTimeoutMs, file.approvalTimeoutMs),
+      DEFAULTS.approvalTimeoutMs,
+    ),
+    approvalIncludeSubagents: toBool(
+      pick(env.DSH_NOTIFY_APPROVAL_SUBAGENTS, cliConfig.approvalIncludeSubagents, file.approvalIncludeSubagents),
+      DEFAULTS.approvalIncludeSubagents,
+    ),
+    link: String(pick(env.DSH_NOTIFY_LINK, cliConfig.link, file.link, DEFAULTS.link)),
     timeoutMs: toInt(pick(env.DSH_NOTIFY_TIMEOUT_MS, file.timeoutMs), DEFAULTS.timeoutMs),
     mail: {
       host: String(pick(env.DSH_NOTIFY_SMTP_HOST, mail.host, DEFAULTS.mail.host)),
@@ -201,6 +230,53 @@ function taskSnippet(session, turn, max = 90) {
     if (flat !== '') return flat
   }
   return ''
+}
+
+/* ------------------------------ 会话身份识别 ------------------------------- */
+
+/**
+ * 取会话标题。优先用监听期间缓存的 session/title，缓存未命中时折叠会话日志。
+ * 多对话并行时，标题是"这条通知属于哪个任务"最有用的一条信息。
+ * @param session - 会话对象
+ * @param cache - Map<sessionId, title>，由 session/title 事件维护
+ * @returns 标题文本，取不到返回空串
+ */
+function sessionTitleOf(session, cache) {
+  const id = session?.id
+  if (id !== undefined && id !== null && cache.has(id)) return cache.get(id)
+  const events = session?.events
+  if (!Array.isArray(events)) return ''
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]
+    if (e?.type === 'session/title' && typeof e.data?.title === 'string') return e.data.title
+  }
+  return ''
+}
+
+/** 会话短号：id 前 8 位，正文里用来对号入座。 */
+function shortId(id) {
+  const text = String(id ?? '')
+  return text === '' ? '' : text.slice(0, 8)
+}
+
+/** 子会话（subagent / fork）判定。 */
+function isChildSession(session) {
+  const header = session?.header
+  return Boolean(header?.parentSession) || (Number(header?.delegationDepth) || 0) > 0
+}
+
+/**
+ * 会话身份行：标题（回退到调用方给的任务原文）+ 短号 + 工作区。
+ * @param fallback - 没有标题时用的替代文本（一般是任务原文）
+ */
+function sessionLines(session, cache, fallback = '') {
+  const title = clip(sessionTitleOf(session, cache) || fallback, 60)
+  const id = shortId(session?.id)
+  const cwd = clip(session?.header?.cwd ?? '', 80)
+  const head = [title || '（无标题会话）', id ? `#${id}` : ''].filter(Boolean).join('  ')
+  const lines = [`会话：${head}`]
+  if (cwd !== '') lines.push(`工作区：${cwd}`)
+  return lines
 }
 
 /* ------------------------------- 连接与读取 -------------------------------- */
@@ -376,6 +452,11 @@ export function apply(ctx, cliConfig = {}) {
 
   const startedAt = new Map()
   const goalStarted = new Map()
+  /** Map<sessionId, title>：session/title 事件随手缓存，通知时直接取。 */
+  const titleCache = new Map()
+  /** Map<"sessionId\0requestId", entry>：正在等用户点的那几个审批。 */
+  const pendingApprovals = new Map()
+  let approvalFlushTimer = null
   let lastSentAt = 0
 
   const deliverMail = async (meta, body) => {
@@ -396,28 +477,119 @@ export function apply(ctx, cliConfig = {}) {
     console.log(`[dsh-notify] 邮件已发送 → ${cfg.mail.to}`)
   }
 
-  /** 只有"长任务轮次完成"这类可重复的通知才走去抖；目标完成 / 异常一律立刻发。 */
-  const emit = (meta, lines, debounce = false) => {
-    if (debounce) {
-      const now = Date.now()
-      if (now - lastSentAt < cfg.debounceMs) return
-      lastSentAt = now
-    }
-    const body = [...lines, '', `时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`]
-      .filter(l => l !== undefined && l !== null && l !== '')
+  /**
+   * 发一条通知。去抖在调用方判断 —— 不同类别的通知互不干扰。
+   * @param meta - KINDS 里的类型（title / short / tag / priority）
+   * @param lines - 正文行（空串保留为段落分隔）
+   * @param subject - 主题里附加的会话标识，手机邮件列表靠它区分多对话
+   */
+  const emit = (meta, lines, subject = '') => {
+    const tail = cfg.link === '' ? [] : ['', `处理：${cfg.link}`]
+    const body = [
+      ...lines,
+      ...tail,
+      '',
+      `时间：${new Date().toLocaleString('zh-CN', { hour12: false })}`,
+    ]
+      .filter(l => l !== undefined && l !== null)
       .join('\n')
+    const title = [meta.short ?? meta.title, clip(subject, 40)].filter(Boolean).join(' · ')
     if (useMail) {
-      deliverMail(meta, body).catch(e => console.warn(`[dsh-notify] 邮件发送失败: ${String(e?.message ?? e)}`))
+      deliverMail({ ...meta, title }, body).catch(e => console.warn(`[dsh-notify] 邮件发送失败: ${String(e?.message ?? e)}`))
     }
-    if (!dryRun && useNtfy) sendNtfy(cfg, meta, body)
+    if (!dryRun && useNtfy) sendNtfy(cfg, { ...meta, title }, body)
+  }
+
+  /* ------------------------------ 审批超时提醒 ------------------------------ */
+
+  /** 把一批已超时的审批渲染成正文。 */
+  const approvalLines = entries => {
+    const now = Date.now()
+    const lines = []
+    for (const entry of entries) {
+      const title = clip(sessionTitleOf(entry.session, titleCache), 50) || '（无标题会话）'
+      const cwd = clip(entry.session?.header?.cwd ?? '', 80)
+      lines.push(`【${shortId(entry.sessionId)}】${title}`)
+      lines.push(`  工具：${entry.toolName}`)
+      if (entry.reason !== '') lines.push(`  原因：${entry.reason}`)
+      lines.push(`  已等待：${formatDuration(now - entry.askedAt)}`)
+      if (cwd !== '') lines.push(`  工作区：${cwd}`)
+      lines.push('')
+    }
+    if (lines[lines.length - 1] === '') lines.pop()
+    return lines
+  }
+
+  /** 同一批超时的审批合并成一封；每个卡住你的请求只提醒一次。 */
+  const scheduleApprovalNotice = () => {
+    if (approvalFlushTimer !== null) return
+    approvalFlushTimer = setTimeout(() => {
+      approvalFlushTimer = null
+      const fresh = [...pendingApprovals.values()].filter(entry => entry.timedout && !entry.notified)
+      if (fresh.length === 0) return
+      for (const entry of fresh) entry.notified = true
+      const subject = fresh.length === 1 ? sessionTitleOf(fresh[0].session, titleCache) : `${fresh.length} 项同时等待`
+      emit(KINDS.approval, approvalLines(fresh), subject)
+    }, APPROVAL_MERGE_MS)
+    approvalFlushTimer.unref?.()
+  }
+
+  /** approval/asked 在开始等待用户之前写入 —— 用它起计时器。 */
+  const onApprovalAsked = (session, event) => {
+    if (cfg.approvalTimeoutMs <= 0) return
+    if (!cfg.approvalIncludeSubagents && isChildSession(session)) return
+    const requestId = event.data?.id
+    if (requestId === undefined || requestId === null) return
+    const key = `${session.id}\u0000${requestId}`
+    if (pendingApprovals.has(key)) return
+    const entry = {
+      session,
+      sessionId: session.id,
+      toolName: clip(event.data?.toolName ?? '未知工具', 40),
+      reason: clip(event.data?.reason ?? '', 120),
+      askedAt: event.time ?? Date.now(),
+      timedout: false,
+      notified: false,
+      timer: null,
+    }
+    entry.timer = setTimeout(() => {
+      entry.timer = null
+      entry.timedout = true
+      scheduleApprovalNotice()
+    }, cfg.approvalTimeoutMs)
+    entry.timer.unref?.()
+    pendingApprovals.set(key, entry)
+  }
+
+  /** approval/decided 在用户作答之后写入 —— 用它取消计时器。 */
+  const onApprovalDecided = (session, event) => {
+    const requestId = event.data?.id
+    if (requestId === undefined || requestId === null) return
+    const key = `${session.id}\u0000${requestId}`
+    const entry = pendingApprovals.get(key)
+    if (entry === undefined) return
+    if (entry.timer !== null) clearTimeout(entry.timer)
+    pendingApprovals.delete(key)
   }
 
   ctx.on('session/event', (session, event) => {
     try {
-      const header = session?.header
-      if (header?.parentSession || (Number(header?.delegationDepth) || 0) > 0) return
       const id = session?.id
       if (id === undefined || id === null) return
+
+      /* ---- 会话标题：先缓存下来，任何通知都用得上（子会话也要） ---- */
+      if (event.type === 'session/title') {
+        const title = event.data?.title
+        if (typeof title === 'string' && title !== '') titleCache.set(id, title)
+        return
+      }
+
+      /* ---- 审批：等太久没人点就提醒（子会话的审批同样会卡住整个任务） ---- */
+      if (event.type === 'approval/asked') return onApprovalAsked(session, event)
+      if (event.type === 'approval/decided') return onApprovalDecided(session, event)
+
+      // 子代理 / fork 出来的会话，除上面两类之外的事件都不进通知
+      if (isChildSession(session)) return
 
       /* ---- 轮次 ---- */
       if (event.type === 'turn/start') {
@@ -439,13 +611,25 @@ export function apply(ctx, cliConfig = {}) {
         const durationMs = Math.max(0, event.time - (goalStarted.get(id) ?? event.time))
         if (goal.phase === 'complete') {
           goalStarted.delete(id)
-          emit(KINDS['goal-completed'], [clip(goal.objective), `耗时 ${formatDuration(durationMs)}`])
+          emit(
+            KINDS['goal-completed'],
+            [...sessionLines(session, titleCache), `目标：${clip(goal.objective, 120)}`, `耗时 ${formatDuration(durationMs)}`],
+            clip(goal.objective, 24),
+          )
           return
         }
         if (goal.phase === 'blocked') {
           goalStarted.delete(id)
           const reason = goal.blockedReason
-          emit(KINDS['goal-blocked'], [clip(goal.objective), clip(reason?.message ?? reason?.kind ?? '目标被阻塞', 60)])
+          emit(
+            KINDS['goal-blocked'],
+            [
+              ...sessionLines(session, titleCache),
+              `目标：${clip(goal.objective, 120)}`,
+              clip(reason?.message ?? reason?.kind ?? '目标被阻塞', 60),
+            ],
+            clip(goal.objective, 24),
+          )
         }
         return
       }
@@ -461,15 +645,20 @@ export function apply(ctx, cliConfig = {}) {
       if (meta === undefined) return
 
       const stats = toolStats(session, event.data?.turn)
+      const label = sessionTitleOf(session, titleCache) || taskSnippet(session, event.data?.turn)
 
       if (kind === 'completed') {
         if (cfg.notifyOn === 'errors') return
         // 两个**客观**判据，都不依赖 agent 是否建了 goal：
         //   ① 这一轮干得够久（longTaskMs）  ② 这一轮动手够多（工具调用次数）
         if (cfg.notifyOn !== 'all' && durationMs < cfg.longTaskMs && stats.count < cfg.minToolCalls) return
+        // 只有"长任务轮次完成"这类可重复的通知才走去抖；目标完成 / 异常 / 审批一律立刻发
+        const now = Date.now()
+        if (now - lastSentAt < cfg.debounceMs) return
+        lastSentAt = now
       }
 
-      const lines = [taskSnippet(session, event.data?.turn)]
+      const lines = [...sessionLines(session, titleCache, taskSnippet(session, event.data?.turn))]
       if (stats.count > 0) lines.push(`调用了 ${stats.count} 次工具`)
       if (durationMs >= 1000) lines.push(`用时 ${formatDuration(durationMs)}`)
       if (kind === 'error') {
@@ -477,7 +666,7 @@ export function apply(ctx, cliConfig = {}) {
         lines.push(`${err.code ?? 'UNKNOWN'}: ${err.message ?? '未知错误'}`)
       }
       if (lines.filter(Boolean).length === 0) lines.push('（无摘要）')
-      emit(meta, lines, kind === 'completed')
+      emit(meta, lines, label)
     } catch (error) {
       console.warn(`[dsh-notify] 处理会话事件失败: ${String(error?.message ?? error)}`)
     }
@@ -489,8 +678,12 @@ export function apply(ctx, cliConfig = {}) {
     goals: `目标完成 / 异常 / 超 ${Math.round(cfg.longTaskMs / 60000)} 分钟 或 工具调用 ≥ ${cfg.minToolCalls} 次的轮次`,
     all: '每轮都推',
   }[cfg.notifyOn]
+  const approvalPolicy = cfg.approvalTimeoutMs > 0
+    ? ` · 审批超时 ${cfg.approvalTimeoutMs < 1000 ? `${cfg.approvalTimeoutMs}ms` : `${Math.round(cfg.approvalTimeoutMs / 1000)}s`} 提醒`
+    : ' · 审批提醒已关闭'
   console.log(
-    `[dsh-notify] 已启用 · 通道 ${cfg.channel} → ${target} · 触发 ${policy} · 去抖 ${cfg.debounceMs}ms` +
+    `[dsh-notify] 已启用 · 通道 ${cfg.channel} → ${target} · 触发 ${policy}${approvalPolicy}` +
+      ` · 去抖 ${cfg.debounceMs}ms` +
       `${cfg.cleanupOld && useMail ? ` · 旧通知自动清理(${cfg.mailTag})` : ''}${dryRun ? ' · dryrun' : ''}`,
   )
 }
