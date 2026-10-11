@@ -15,6 +15,19 @@
  *   就是真实等待时长，完全不用碰审批链本身（也就绝不会替用户做决定）。
  *   同一批（3 秒内）超时的多个审批合并成一封；每个请求只提醒一次。
  *
+ * 提问超时提醒（questionTimeoutMs，默认 60 秒；**独立于 notifyOn**）：
+ *   另一类更常见的"卡住"：agent 用 ask_user_question 弹出一道选择题问你，
+ *   你人在外面没看见，它就干等着。等超过 questionTimeoutMs 还没回答的提问，
+ *   会发一封提醒，正文里带上**问题原文和候选项**，手机上不用打开 GUI 也知道
+ *   它想问什么，回去点一下就能继续。
+ *   判据（2026-10-08 从真实会话日志里实测出来的）：
+ *     - 开始等待：tool/call 且 data.name === 'ask_user_question'，取 data.callId
+ *     - 用户作答：tool/result 且 data.message.source.callId === callId
+ *       （注意不是 data.toolCallId，那个字段在日志里是 undefined；答案 JSON
+ *        就在 data.message.content[0].text 里，形如 {"answers":[...]}）
+ *   两者时间差就是真实等待时长（实测样本 16s / 34s / 64s / 323s / 1883s）。
+ *   同样只起计时器、只看日志，绝不替你作答。
+ *
  * 通知里怎么认出"是哪个任务"（多对话并行时）：
  *   每条通知都带会话标题（session/title 事件）、会话号（id 前 8 位）
  *   和所属工作区（cwd）；主题里也带一小段标题，手机邮件列表就能分辨。
@@ -52,6 +65,8 @@ const DEFAULTS = {
   mailTag: '[dsh-notify]', // 通知邮件的主题前缀，IMAP 靠它识别"自己的邮件"
   approvalTimeoutMs: 60000, // 审批挂起超过这个时间就提醒；0 = 关掉审批提醒
   approvalIncludeSubagents: true, // 子代理的审批同样会卡住整个任务，默认一并提醒
+  questionTimeoutMs: 60000, // 提问（ask_user_question）挂起超过这个时间就提醒；0 = 关掉
+  questionIncludeSubagents: true, // 子代理的提问同样会卡住整个任务，默认一并提醒
   link: '', // 邮件里附带回 DSH 的链接（如 Tailscale 地址），手机点开直接去点审批
   mail: { host: '', port: 465, user: '', pass: '', to: '' },
   imap: { host: 'imap.qq.com', port: 993 },
@@ -64,6 +79,7 @@ const APPROVAL_MERGE_MS = 3000
 
 const KINDS = {
   approval: { title: '🔐 等你审批', short: '🔐 等审批', tag: 'lock', priority: 'high' },
+  question: { title: '⏳ 等你回答', short: '⏳ 待回答', tag: 'hourglass_flowing_sand', priority: 'high' },
   completed: { title: '✅ 任务完成', short: '✅ 完成', tag: 'white_check_mark', priority: 'default' },
   'goal-completed': { title: '🎯 目标完成', short: '🎯 目标完成', tag: 'tada', priority: 'default' },
   'goal-blocked': { title: '⚠️ 目标受阻', short: '⚠️ 目标受阻', tag: 'warning', priority: 'high' },
@@ -138,6 +154,14 @@ function resolveConfig(cliConfig = {}) {
     approvalIncludeSubagents: toBool(
       pick(env.DSH_NOTIFY_APPROVAL_SUBAGENTS, cliConfig.approvalIncludeSubagents, file.approvalIncludeSubagents),
       DEFAULTS.approvalIncludeSubagents,
+    ),
+    questionTimeoutMs: toInt(
+      pick(env.DSH_NOTIFY_QUESTION_MS, cliConfig.questionTimeoutMs, file.questionTimeoutMs),
+      DEFAULTS.questionTimeoutMs,
+    ),
+    questionIncludeSubagents: toBool(
+      pick(env.DSH_NOTIFY_QUESTION_SUBAGENTS, cliConfig.questionIncludeSubagents, file.questionIncludeSubagents),
+      DEFAULTS.questionIncludeSubagents,
     ),
     link: String(pick(env.DSH_NOTIFY_LINK, cliConfig.link, file.link, DEFAULTS.link)),
     timeoutMs: toInt(pick(env.DSH_NOTIFY_TIMEOUT_MS, file.timeoutMs), DEFAULTS.timeoutMs),
@@ -456,7 +480,10 @@ export function apply(ctx, cliConfig = {}) {
   const titleCache = new Map()
   /** Map<"sessionId\0requestId", entry>：正在等用户点的那几个审批。 */
   const pendingApprovals = new Map()
+  /** Map<"sessionId\0callId", entry>：正在等用户回答的那几个提问。 */
+  const pendingQuestions = new Map()
   let approvalFlushTimer = null
+  let questionFlushTimer = null
   let lastSentAt = 0
 
   const deliverMail = async (meta, body) => {
@@ -572,6 +599,116 @@ export function apply(ctx, cliConfig = {}) {
     pendingApprovals.delete(key)
   }
 
+  /* ------------------------------ 提问超时提醒 ------------------------------ */
+
+  /**
+   * 从 ask_user_question 的参数里抠出「问题原文 + 候选项」，供提醒正文使用。
+   * 参数一般是对象；个别 provider 会塞成 JSON 字符串，这里顺着解一下。
+   * @returns { questions: string[], options: string[] }
+   */
+  const questionBrief = args => {
+    let parsed = args
+    if (typeof parsed === 'string') {
+      try { parsed = JSON.parse(parsed) } catch { parsed = null }
+    }
+    const list = Array.isArray(parsed?.questions) ? parsed.questions : []
+    const questions = []
+    const options = []
+    for (const item of list.slice(0, 3)) {
+      const text = clip(item?.question ?? item?.header ?? '', 120)
+      if (text !== '') questions.push(text)
+      for (const option of (Array.isArray(item?.options) ? item.options : []).slice(0, 3)) {
+        const label = clip(option?.label ?? '', 30)
+        if (label !== '' && !options.includes(label) && options.length < 6) options.push(label)
+      }
+    }
+    return { questions, options }
+  }
+
+  /** 把一批已超时的提问渲染成正文（同一会话的多个提问共用一行标题）。 */
+  const questionLines = entries => {
+    const now = Date.now()
+    const grouped = new Map()
+    for (const entry of entries) {
+      if (!grouped.has(entry.sessionId)) grouped.set(entry.sessionId, { session: entry.session, items: [] })
+      grouped.get(entry.sessionId).items.push(entry)
+    }
+    const lines = []
+    for (const { session, items } of grouped.values()) {
+      const title = clip(sessionTitleOf(session, titleCache), 50) || '（无标题会话）'
+      const cwd = clip(session?.header?.cwd ?? '', 80)
+      lines.push(`【${shortId(session?.id)}】${title}`)
+      for (const entry of items) {
+        for (const q of entry.questions) lines.push(`  问：${q}`)
+        if (entry.options.length > 0) lines.push(`  选项：${clip(entry.options.join(' ／ '), 150)}`)
+        lines.push(`  已等待：${formatDuration(now - entry.askedAt)}`)
+      }
+      if (cwd !== '') lines.push(`  工作区：${cwd}`)
+      lines.push('')
+    }
+    if (lines[lines.length - 1] === '') lines.pop()
+    return lines
+  }
+
+  /** 同一批超时的提问合并成一封；每个卡住你的提问只提醒一次。 */
+  const scheduleQuestionNotice = () => {
+    if (questionFlushTimer !== null) return
+    questionFlushTimer = setTimeout(() => {
+      questionFlushTimer = null
+      const fresh = [...pendingQuestions.values()].filter(entry => entry.timedout && !entry.notified)
+      if (fresh.length === 0) return
+      for (const entry of fresh) entry.notified = true
+      const subject = fresh.length === 1
+        ? clip(fresh[0].questions[0] ?? sessionTitleOf(fresh[0].session, titleCache), 40)
+        : `${fresh.length} 个提问在等你回答`
+      emit(KINDS.question, questionLines(fresh), subject)
+    }, APPROVAL_MERGE_MS)
+    questionFlushTimer.unref?.()
+  }
+
+  /** tool/call(ask_user_question) 在开始等用户输入之前写入 —— 用它起计时器。 */
+  const onQuestionAsked = (session, event) => {
+    if (cfg.questionTimeoutMs <= 0) return
+    if (!cfg.questionIncludeSubagents && isChildSession(session)) return
+    const callId = event.data?.callId
+    if (callId === undefined || callId === null || callId === '') return
+    const key = `${session.id}\u0000${callId}`
+    if (pendingQuestions.has(key)) return
+    const { questions, options } = questionBrief(event.data?.arguments)
+    const entry = {
+      session,
+      sessionId: session.id,
+      questions: questions.length > 0 ? questions : ['（问题内容没解析出来，回去看一眼）'],
+      options,
+      askedAt: event.time ?? Date.now(),
+      timedout: false,
+      notified: false,
+      timer: null,
+    }
+    entry.timer = setTimeout(() => {
+      entry.timer = null
+      entry.timedout = true
+      scheduleQuestionNotice()
+    }, cfg.questionTimeoutMs)
+    entry.timer.unref?.()
+    pendingQuestions.set(key, entry)
+  }
+
+  /**
+   * tool/result 里的 callId 藏在 data.message.source 下（data.toolCallId 是空的）
+   * —— 用它认出"用户已经作答"，取消计时器。非提问的结果在这里查不到 key，直接放过。
+   */
+  const onQuestionAnswered = (session, event) => {
+    if (pendingQuestions.size === 0) return
+    const callId = event.data?.message?.source?.callId
+    if (callId === undefined || callId === null || callId === '') return
+    const key = `${session.id}\u0000${callId}`
+    const entry = pendingQuestions.get(key)
+    if (entry === undefined) return
+    if (entry.timer !== null) clearTimeout(entry.timer)
+    pendingQuestions.delete(key)
+  }
+
   ctx.on('session/event', (session, event) => {
     try {
       const id = session?.id
@@ -588,7 +725,11 @@ export function apply(ctx, cliConfig = {}) {
       if (event.type === 'approval/asked') return onApprovalAsked(session, event)
       if (event.type === 'approval/decided') return onApprovalDecided(session, event)
 
-      // 子代理 / fork 出来的会话，除上面两类之外的事件都不进通知
+      /* ---- 提问：等太久没人回答就提醒（同样是"你不动它就不动"的卡点） ---- */
+      if (event.type === 'tool/call' && event.data?.name === 'ask_user_question') onQuestionAsked(session, event)
+      if (event.type === 'tool/result') onQuestionAnswered(session, event)
+
+      // 子代理 / fork 出来的会话，除上面几类之外的事件都不进通知
       if (isChildSession(session)) return
 
       /* ---- 轮次 ---- */
@@ -681,8 +822,11 @@ export function apply(ctx, cliConfig = {}) {
   const approvalPolicy = cfg.approvalTimeoutMs > 0
     ? ` · 审批超时 ${cfg.approvalTimeoutMs < 1000 ? `${cfg.approvalTimeoutMs}ms` : `${Math.round(cfg.approvalTimeoutMs / 1000)}s`} 提醒`
     : ' · 审批提醒已关闭'
+  const questionPolicy = cfg.questionTimeoutMs > 0
+    ? ` · 提问超时 ${cfg.questionTimeoutMs < 1000 ? `${cfg.questionTimeoutMs}ms` : `${Math.round(cfg.questionTimeoutMs / 1000)}s`} 提醒`
+    : ' · 提问提醒已关闭'
   console.log(
-    `[dsh-notify] 已启用 · 通道 ${cfg.channel} → ${target} · 触发 ${policy}${approvalPolicy}` +
+    `[dsh-notify] 已启用 · 通道 ${cfg.channel} → ${target} · 触发 ${policy}${approvalPolicy}${questionPolicy}` +
       ` · 去抖 ${cfg.debounceMs}ms` +
       `${cfg.cleanupOld && useMail ? ` · 旧通知自动清理(${cfg.mailTag})` : ''}${dryRun ? ' · dryrun' : ''}`,
   )

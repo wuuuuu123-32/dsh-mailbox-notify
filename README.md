@@ -22,12 +22,13 @@
 
 1. 任务结束时给你发邮件
 2. **每次发新通知前，自动把上一封删掉** —— 邮箱里永远最多只有一封
-3. **审批卡住时单独提醒你** —— agent 弹出权限确认后没人点，它就一直停在那儿，这种"最需要你介入"的时刻必须能被推到手机上
+3. **审批 / 提问卡住时单独提醒你** —— agent 弹出权限确认、或者弹出一道选择题问你，没人回应它就一直停在那儿，这种"最需要你介入"的时刻必须能被推到手机上
 
 ## 特性
 
 - **邮件通知** —— 任意 SMTP 邮箱（QQ / 163 / Gmail / Outlook / 自建都行）。不需要 VPN、不需要装 App、不需要注册任何第三方服务
 - **审批超时提醒** —— 权限审批挂起超过 60 秒（可配）就发一封，告诉你**是哪个会话、在等你批准什么操作、已经等了多久**
+- **提问超时提醒** —— agent 用 `ask_user_question` 问你一道选择题，超过 60 秒（可配）没回答就发一封，正文里带上**问题原文和候选项**，手机上不打开 GUI 也知道它在问什么
 - **多对话可分辨** —— 每条通知都带会话标题、会话号和工作区，**邮件主题里直接带一段会话标题**（40 字以内），并行跑几个任务时在手机邮件列表一眼看出是哪个
 - **旧通知自动清理** —— 通知邮件主题统一带 `[dsh-notify]` 前缀，每发一封新的就用 IMAP 删掉上一封。**只删带这个前缀的邮件**，绝不碰你其它邮件
 - **不刷屏** —— 只在值得打扰的时候发（见下表）
@@ -46,9 +47,10 @@
 | 单轮耗时 ≥ `longTaskMs`（默认 3 分钟） | ✅ 发 |
 | 单轮工具调用 ≥ `minToolCalls`（默认 5 次） | ✅ 发 |
 | 审批挂起 ≥ `approvalTimeoutMs`（默认 60 秒）没人点 | ✅ 发（**独立于 `notifyOn`**） |
+| 提问挂起 ≥ `questionTimeoutMs`（默认 60 秒）没人回答 | ✅ 发（**独立于 `notifyOn`**） |
 | 普通问答、闲聊、几秒钟的小活儿 | ❌ 不发 |
 
-想更安静就设 `notifyOn: "errors"`（只报错，审批提醒照旧）；想每轮都收就设 `"all"`。
+想更安静就设 `notifyOn: "errors"`（只报错，审批 / 提问提醒照旧）；想每轮都收就设 `"all"`。
 
 > **后两条是客观判据，不依赖 agent 有没有建 goal。** 早期版本的 `goals` 档靠 `create_goal` 触发，agent 忘了建 goal 就不发通知；现在只要"这一轮干得够久"或"动手够多"就会发。建 goal 依然有用 —— 通知里会带上目标原文。
 
@@ -70,6 +72,25 @@ approval/decided  ← 用户真的点了（批准 / 拒绝 / 取消）
 - 每个请求只提醒一次；子代理的审批同样会卡住整个任务，所以默认也提醒
 
 **这个机制只是"看着"，不参与审批本身** —— 插件绝不会替你点同意或拒绝，你没点之前它就一直等着。
+
+### 提问提醒是怎么判定的
+
+`ask_user_question` 在会话日志里是一对工具事件（2026-10-08 从真实日志里实测出来的字段）：
+
+```
+tool/call    name = "ask_user_question"   callId = call_xx…   ← 开始等你回答
+      ……     你人在外面没看见，agent 就一直停在这里
+tool/result  message.source.callId = call_xx…                ← 你答完了
+```
+
+答案 JSON（`{"answers":[{"id":"route","selected":["…"]}]}`）就写在 `tool/result` 的正文里，
+时间差就是真实等待时长（现有会话里的实测样本：16s / 34s / 64s / 323s / 1883s）。
+
+- 60 秒内答了 → 什么都不发
+- 超过 60 秒还没答 → 发一封，正文带**问题原文 + 候选项 + 已等待多久**
+- 同一批（3 秒内）超时的多个提问合并成一封；同一会话的多个提问共用一行标题，不重复
+- 每个提问只提醒一次；子代理的提问默认也提醒（`questionIncludeSubagents`）
+- ❗配对用的是 `data.message.source.callId`，**不是** `data.toolCallId` —— 后者在这版日志里是空的
 
 ## 安装
 
@@ -133,13 +154,15 @@ dsh plugin --profile web add github:<你的用户名>/dsh-mailbox-notify
 | `mailTag` | `"[dsh-notify]"` | 通知邮件的主题前缀，IMAP 靠它识别自己的邮件 |
 | `approvalTimeoutMs` | `60000` | 审批挂起多久后提醒；设 `0` 关掉审批提醒 |
 | `approvalIncludeSubagents` | `true` | 子代理的审批要不要也提醒 |
+| `questionTimeoutMs` | `60000` | 提问（`ask_user_question`）挂起多久后提醒；设 `0` 关掉提问提醒 |
+| `questionIncludeSubagents` | `true` | 子代理的提问要不要也提醒 |
 | `link` | `""` | 邮件末尾附带回 dsh 的链接，留空则不附 |
 | `mail.*` | — | SMTP 服务器、端口、账号、授权码、收件地址 |
 | `imap.*` | `imap.qq.com:993` | 用来清理旧通知的 IMAP 服务器 |
 | `ntfy.topic` | `""` | 填了才启用 ntfy 通道 |
 | `timeoutMs` | `25000` | 网络操作超时 |
 
-也可以用环境变量覆盖：`DSH_NOTIFY_CHANNEL`、`DSH_NOTIFY_ON`、`DSH_NOTIFY_APPROVAL_MS`、`DSH_NOTIFY_LINK`、`DSH_NOTIFY_SMTP_HOST`、`DSH_NOTIFY_SMTP_USER`、`DSH_NOTIFY_SMTP_PASS`、`DSH_NOTIFY_MAIL_TO` 等（完整列表见源码 `resolveConfig`）。
+也可以用环境变量覆盖：`DSH_NOTIFY_CHANNEL`、`DSH_NOTIFY_ON`、`DSH_NOTIFY_APPROVAL_MS`、`DSH_NOTIFY_QUESTION_MS`、`DSH_NOTIFY_LINK`、`DSH_NOTIFY_SMTP_HOST`、`DSH_NOTIFY_SMTP_USER`、`DSH_NOTIFY_SMTP_PASS`、`DSH_NOTIFY_MAIL_TO` 等（完整列表见源码 `resolveConfig`）。
 
 ## 通知长什么样
 
@@ -172,6 +195,22 @@ dsh plugin --profile web add github:<你的用户名>/dsh-mailbox-notify
 时间：2026-09-19 23:17:51
 ```
 
+提问提醒是（正文直接带问题原文和候选项，手机上不用回 GUI 也知道它在问什么）：
+
+```
+[dsh-notify] ⏳ 待回答 · 走哪条路把数据读出来？
+
+【8eda7b93】导出聊天记录
+  问：走哪条路把数据读出来？
+  选项：Tulpa 轻量版（推荐） ／ 自己写脚本解库
+  已等待：1min 12s
+  工作区：D:\dsh\config
+
+处理：https://你的-dsh-地址/
+
+时间：2026-10-08 21:00:18
+```
+
 ## 工作原理
 
 ```
@@ -180,6 +219,10 @@ dsh 一个会话事件
       ├─ approval/asked ─→ 起计时器（默认 60 秒）
       │        └─ approval/decided 到了？是 → 取消计时器，什么都不发
       │                       否 → 超时，发提醒
+      │
+      ├─ tool/call = ask_user_question ─→ 起计时器（默认 60 秒）
+      │        └─ 配对的 tool/result 到了？是 → 取消计时器，什么都不发
+      │                       否 → 超时，发提醒（带问题原文和选项）
       │
       ├─ 是"值得打扰"的事件吗？  否 → 什么都不做
       │
@@ -201,6 +244,12 @@ dsh 一个会话事件
 **审批提醒为什么没来？**
 三个可能：① `approvalTimeoutMs` 设成了 0；② 你在 60 秒内已经点掉了（那就不该打扰你）；③ 那次请求根本不需要你点 —— 比如权限预设是「完全权限」，审批会自动通过，`approval/asked` 和 `approval/decided` 几乎同时写入，计时器立刻被取消。
 
+**提问提醒为什么没来？**
+同上三条，把 `approvalTimeoutMs` 换成 `questionTimeoutMs`；另外提问提醒只在 agent 真的用了 `ask_user_question` 时才会触发 —— 它直接把问题写在回答里问你（不走工具）是抓不到的。
+
+**为什么收到提醒，但正文里只有"3 个提问在等你回答"？**
+说明同一时刻（3 秒窗口内）有多个提问一起超时，被合并进同一封邮件了，往下看每个会话的正文就行。
+
 **收到提醒了，但回去看界面上没有审批框？**
 说明它已经被处理（自动通过、被取消，或你在别处点了）。邮件是"那一刻还挂着"的快照，不代表现在仍然挂着。
 
@@ -214,12 +263,12 @@ dsh 一个会话事件
 正常，前缀变了就搜不到旧的了。用工具脚本先清理一次。
 
 **安全吗？**
-授权码只存在你本机的配置文件里，不会上传到任何地方。它只能用来收发你自己的邮件，随时可以在邮箱设置里作废重发。插件本身不监听端口、不向任何第三方服务发送数据（除非你开了 ntfy）；审批提醒也只读事件日志，不会替你作答。
+授权码只存在你本机的配置文件里，不会上传到任何地方。它只能用来收发你自己的邮件，随时可以在邮箱设置里作废重发。插件本身不监听端口、不向任何第三方服务发送数据（除非你开了 ntfy）；审批 / 提问提醒也只读事件日志，不会替你作答。
 
 ## 开发
 
 ```bash
-node test-logic.mjs     # dryrun 验证"什么情况才推送"（含审批超时用例，约 8 秒）
+node test-logic.mjs     # dryrun 验证"什么情况才推送"（含审批 / 提问超时用例，约 16 秒）
 node test-mail.mjs      # 实测邮件通道
 node test-cleanup.mjs   # 实测"发新的+删旧的"链路
 DSH_NOTIFY_DRYRUN=1 …   # 任何发送都只打印不执行

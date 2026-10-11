@@ -9,3 +9,8 @@ config.json
 # 测试产物 / 临时文件
 *.log
 _tmp_*
+_probe-*.mjs
+
+# 本机自用的调用脚本（复用本插件的 config.json，不对外发布）
+notify-h3-download.mjs
+send-file-mail.mjs

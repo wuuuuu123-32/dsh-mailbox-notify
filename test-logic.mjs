@@ -1,12 +1,12 @@
 // dryrun 逻辑测试：验证"什么情况才推送"
 // 注意：去抖基于真实墙上时间，测试里关掉（debounceMs: 0），才能逐个验证判据。
-// 审批超时用的是毫秒级短阈值；合并窗口（APPROVAL_MERGE_MS = 3 秒）是内部常量，
-// 所以审批用例要真的等一会儿 —— 整个脚本约 8 秒跑完。
+// 审批超时 / 提问超时用的是毫秒级短阈值；合并窗口（APPROVAL_MERGE_MS = 3 秒）是内部常量，
+// 所以这两类用例要真的等一会儿 —— 整个脚本约 16 秒跑完。
 process.env.DSH_NOTIFY_DRYRUN = '1'
 const { apply } = await import('./index.js')
 
 const handlers = []
-apply({ on: (_name, fn) => handlers.push(fn) }, { debounceMs: 0, approvalTimeoutMs: 40 })
+apply({ on: (_name, fn) => handlers.push(fn) }, { debounceMs: 0, approvalTimeoutMs: 40, questionTimeoutMs: 40 })
 const fire = (session, event) => handlers[0](session, event)
 
 const show = label => console.log(`\n### ${label}`)
@@ -90,6 +90,63 @@ const child = toolSession('s-child', ['read', 'grep', 'write', 'edit', 'pwsh'], 
 child.header = { parentSession: 's-test', delegationDepth: 1 }
 fire(child, { type: 'turn/start', time: 200000, data: { turn: 1 } })
 fire(child, { type: 'turn/end', time: 206000, data: { turn: 1, reason: { kind: 'completed' } } })
+
+/* --------------------------- 需求 3：提问超时提醒 --------------------------- */
+
+const ask = { id: 's-ask-1', header: { cwd: 'D:\\dsh\\config' }, events: [] }
+fire(ask, { type: 'session/title', time: 1, data: { title: '导出聊天记录', messageSeqs: [1], source: { kind: 'fallback' } } })
+
+show('⑫ 提问挂起超过 40ms 没人回答 → 该推（正文带问题原文和候选项）')
+fire(ask, {
+  type: 'tool/call',
+  time: Date.now(),
+  data: {
+    turn: 1,
+    step: 1,
+    callId: 'call_q1',
+    name: 'ask_user_question',
+    arguments: {
+      questions: [{
+        id: 'route',
+        header: '选路线',
+        question: '走哪条路把数据读出来？',
+        options: [{ label: 'Tulpa 轻量版（推荐）' }, { label: '自己写脚本解库' }],
+      }],
+    },
+  },
+})
+await sleep(3600)
+
+show('⑬ 提问 20ms 内就被回答 → 不该推（屏幕上没人被卡住）')
+fire(ask, {
+  type: 'tool/call',
+  time: Date.now(),
+  data: {
+    turn: 1,
+    step: 2,
+    callId: 'call_q2',
+    name: 'ask_user_question',
+    arguments: { questions: [{ id: 'restart', question: '要不要现在重启 DSH？' }] },
+  },
+})
+await sleep(20)
+// 回答在日志里就是一次 tool/result，callId 藏在 data.message.source 下（不是 data.toolCallId）
+fire(ask, {
+  type: 'tool/result',
+  time: Date.now(),
+  data: { message: { source: { kind: 'tool', callId: 'call_q2' }, content: [{ type: 'text', text: '{"answers":[{"id":"restart","selected":["好"]}]}' }] } },
+})
+await sleep(200)
+console.log('（上面这一段没有输出 = 正确）')
+
+show('⑭ 子代理会话的提问 → 默认也提醒（它同样会卡住整个任务）')
+const askChild = { id: 's-ask-child', header: { parentSession: 's-test', delegationDepth: 1 }, events: [] }
+fire(askChild, {
+  type: 'tool/call',
+  time: Date.now(),
+  data: { turn: 1, step: 1, callId: 'call_q3', name: 'ask_user_question', arguments: { questions: [{ question: '子代理在等一个答案' }] } },
+})
+await sleep(3600)
 
 console.log('\n=== 测试结束 ===')
 console.log('（去抖场景需要真实时间流逝，不在此测试中验证）')

@@ -9,6 +9,8 @@
 
   "approvalTimeoutMs": 60000,
   "approvalIncludeSubagents": true,
+  "questionTimeoutMs": 60000,
+  "questionIncludeSubagents": true,
   "link": "",
 
   "mail": {
