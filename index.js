@@ -46,7 +46,8 @@
  * 调试时设 DSH_NOTIFY_DRYRUN=1，只打印不真发。
  */
 
-import { readFileSync } from 'node:fs'
+import { appendFileSync, readFileSync } from 'node:fs'
+import net from 'node:net'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -68,7 +69,15 @@ const DEFAULTS = {
   questionTimeoutMs: 60000, // 提问（ask_user_question）挂起超过这个时间就提醒；0 = 关掉
   questionIncludeSubagents: true, // 子代理的提问同样会卡住整个任务，默认一并提醒
   link: '', // 邮件里附带回 DSH 的链接（如 Tailscale 地址），手机点开直接去点审批
-  mail: { host: '', port: 465, user: '', pass: '', to: '' },
+  // starttls: false 用隐式 TLS（465，连上就握手）；
+  //           true  用明文连接 + STARTTLS 升级（587，先 EHLO 再升级）。
+  // 2026-10-12 实测：smtp.qq.com:465 直接 TLS 报 "wrong version number"
+  // （465 端口回的是明文 220 问候语），587 + STARTTLS 正常，所以两种都要支持。
+  // debugTrace: true 时，把"插件被挂载 / 收到哪个事件 / 某轮为什么发或不发 / 发信结果"
+  // 逐行追加到包目录下的 _trace.log。默认关（插件设计上不写文件）。
+  // 2026-10-12 加：排查"通知没到"时，光看邮箱分不清是没触发还是发信失败。
+  debugTrace: false,
+  mail: { host: '', port: 465, starttls: false, user: '', pass: '', to: '' },
   imap: { host: 'imap.qq.com', port: 993 },
   ntfy: { topic: '', server: 'https://ntfy.sh' },
   timeoutMs: 25000,
@@ -164,10 +173,12 @@ function resolveConfig(cliConfig = {}) {
       DEFAULTS.questionIncludeSubagents,
     ),
     link: String(pick(env.DSH_NOTIFY_LINK, cliConfig.link, file.link, DEFAULTS.link)),
+    debugTrace: toBool(pick(env.DSH_NOTIFY_DEBUG_TRACE, cliConfig.debugTrace, file.debugTrace), DEFAULTS.debugTrace),
     timeoutMs: toInt(pick(env.DSH_NOTIFY_TIMEOUT_MS, file.timeoutMs), DEFAULTS.timeoutMs),
     mail: {
       host: String(pick(env.DSH_NOTIFY_SMTP_HOST, mail.host, DEFAULTS.mail.host)),
       port: toInt(pick(mail.port, DEFAULTS.mail.port), DEFAULTS.mail.port),
+      starttls: toBool(pick(env.DSH_NOTIFY_SMTP_STARTTLS, mail.starttls), DEFAULTS.mail.starttls),
       user: String(pick(env.DSH_NOTIFY_SMTP_USER, mail.user, DEFAULTS.mail.user)),
       pass: String(pick(env.DSH_NOTIFY_SMTP_PASS, mail.pass, DEFAULTS.mail.pass)),
       to: String(pick(env.DSH_NOTIFY_MAIL_TO, mail.to, mail.user, DEFAULTS.mail.to)),
@@ -187,6 +198,12 @@ function resolveConfig(cliConfig = {}) {
 
 const b64 = s => Buffer.from(String(s), 'utf8').toString('base64')
 const quote = s => `"${String(s).replace(/([\\"])/g, '\\$1')}"`
+
+/** 诊断日志：只在 cfg.debugTrace 打开时写包目录下的 _trace.log，写失败绝不影响通知。 */
+const TRACE_FILE = fileURLToPath(new URL('./_trace.log', import.meta.url))
+function traceLine(text) {
+  try { appendFileSync(TRACE_FILE, `${new Date().toISOString()} ${text}\n`) } catch { /* 忽略 */ }
+}
 
 /** HTTP 头只能安全携带 ASCII，中文按 RFC 2047 编码。 */
 function headerText(text) {
@@ -364,12 +381,54 @@ function makeImapReader(socket) {
   return tag => new Promise(resolve => { waiter = { tag, resolve }; pump() })
 }
 
+/** 明文 TCP 连接（STARTTLS 的第一段）。 */
+function connectPlain(host, port, timeoutMs) {
+  const socket = net.connect({ host, port })
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error('连接超时')) }, timeoutMs)
+    socket.once('connect', () => { clearTimeout(timer); resolve(socket) })
+    socket.once('error', error => { clearTimeout(timer); reject(error) })
+  })
+}
+
+/**
+ * STARTTLS 通道（587 常用）：明文连上 → 读 220 → EHLO → STARTTLS → 220
+ * → 把同一个 socket 升级成 TLS，返回升级后的 socket。
+ * 升级后必须**再 EHLO 一次**（TLS 层内的会话重新开始），这一步由 sendMail 负责。
+ */
+async function connectStarttls(host, port, timeoutMs) {
+  const raw = await connectPlain(host, port, timeoutMs)
+  const read = makeSmtpReader(raw)
+  const first = async () => (await read()).split('\n')[0]
+
+  let line = await first()
+  if (!line.startsWith('220')) throw new Error(`SMTP 未返回 220：${line}`)
+  raw.write('EHLO dsh-notify\r\n')
+  const ehlo = await read()
+  line = ehlo.split('\n')[0]
+  if (!line.startsWith('250')) throw new Error(`EHLO 失败：${line}`)
+  if (!/STARTTLS/i.test(ehlo)) throw new Error('服务器没有广告 STARTTLS（这个端口可能要用隐式 TLS）')
+  raw.write('STARTTLS\r\n')
+  line = await first()
+  if (!line.startsWith('220')) throw new Error(`STARTTLS 被拒绝：${line}`)
+
+  return await new Promise((resolve, reject) => {
+    const socket = tls.connect({ socket: raw, servername: host })
+    const timer = setTimeout(() => { socket.destroy(); reject(new Error('TLS 握手超时')) }, timeoutMs)
+    socket.once('secureConnect', () => { clearTimeout(timer); resolve(socket) })
+    socket.once('error', error => { clearTimeout(timer); reject(error) })
+  })
+}
+
 /* --------------------------------- 邮件通道 -------------------------------- */
 
 export async function sendMail(cfg, subject, text) {
   if (!cfg.host || !cfg.user || !cfg.pass || !cfg.to) throw new Error('邮件配置不完整')
 
-  const socket = await connectTls(cfg.host, cfg.port, cfg.timeoutMs)
+  const useStarttls = cfg.starttls === true
+  const socket = useStarttls
+    ? await connectStarttls(cfg.host, cfg.port, cfg.timeoutMs)
+    : await connectTls(cfg.host, cfg.port, cfg.timeoutMs)
   const read = makeSmtpReader(socket)
   const expect = async code => {
     const raw = await read()
@@ -379,7 +438,8 @@ export async function sendMail(cfg, subject, text) {
   const say = line => socket.write(`${line}\r\n`)
 
   try {
-    await expect(220)
+    // 隐式 TLS：服务器先给 220 问候语；STARTTLS 那一段在 connectStarttls 里已经消费掉了
+    if (!useStarttls) await expect(220)
     say('EHLO dsh-notify')
     await expect(250)
     say('AUTH LOGIN')
@@ -473,9 +533,17 @@ export function apply(ctx, cliConfig = {}) {
   const useMail = cfg.channel === 'mail' || cfg.channel === 'both'
   const useNtfy = cfg.channel === 'ntfy' || cfg.channel === 'both'
   const dryRun = process.env.DSH_NOTIFY_DRYRUN === '1'
+  const trace = cfg.debugTrace ? traceLine : () => {}
+  trace(`apply · notifyOn=${cfg.notifyOn} channel=${cfg.channel} mail=${cfg.mail.host}:${cfg.mail.port} starttls=${cfg.mail.starttls} to=${cfg.mail.to}`)
 
   const startedAt = new Map()
   const goalStarted = new Map()
+  /**
+   * Map<"sessionId\0turn", number>：**自己数**这一轮调了几次工具。
+   * 2026-10-12 实测：不能再靠 session.events 里翻（在运行时读出来是 0 —— trace 里
+   * 写着 "39s 且 0 次工具"，而那一轮实际调了 6 次），所以改成从 session/event 流里累加。
+   */
+  const toolCounts = new Map()
   /** Map<sessionId, title>：session/title 事件随手缓存，通知时直接取。 */
   const titleCache = new Map()
   /** Map<"sessionId\0requestId", entry>：正在等用户点的那几个审批。 */
@@ -500,8 +568,15 @@ export function apply(ctx, cliConfig = {}) {
       }
     }
     // 前缀留明文（IMAP 靠它搜索），标题本体按 RFC 2047 编码，避免邮件头出现裸非 ASCII
-    await sendMail({ ...cfg.mail, timeoutMs: cfg.timeoutMs }, `${cfg.mailTag} ${headerText(meta.title)}`, body)
-    console.log(`[dsh-notify] 邮件已发送 → ${cfg.mail.to}`)
+    trace(`sendMail → ${cfg.mail.host}:${cfg.mail.port} (starttls=${cfg.mail.starttls}) title=${meta.title}`)
+    try {
+      await sendMail({ ...cfg.mail, timeoutMs: cfg.timeoutMs }, `${cfg.mailTag} ${headerText(meta.title)}`, body)
+      trace(`sendMail OK`)
+      console.log(`[dsh-notify] 邮件已发送 → ${cfg.mail.to}`)
+    } catch (error) {
+      trace(`sendMail FAIL ${String(error?.message ?? error)}`)
+      throw error
+    }
   }
 
   /**
@@ -521,8 +596,18 @@ export function apply(ctx, cliConfig = {}) {
       .filter(l => l !== undefined && l !== null)
       .join('\n')
     const title = [meta.short ?? meta.title, clip(subject, 40)].filter(Boolean).join(' · ')
+    trace(`emit ${meta.title} · ${title}`)
     if (useMail) {
-      deliverMail({ ...meta, title }, body).catch(e => console.warn(`[dsh-notify] 邮件发送失败: ${String(e?.message ?? e)}`))
+      deliverMail({ ...meta, title }, body).catch(e => {
+        const msg = String(e?.message ?? e)
+        // 2026-10-12：smtp.qq.com:465 曾回明文 220（wrong version number），
+        // 排查时最容易误判成"插件没触发"，所以这里把可能的方向直接打出来。
+        const hint = /wrong version number|handshake|ECONNRESET|超时/i.test(msg)
+          ? `（连接方式可能不对：试 mail.port=587 + mail.starttls=true，或 mail.port=465 + mail.starttls=false）`
+          : ''
+        console.warn(`[dsh-notify] 邮件发送失败: ${msg}${hint}`)
+        trace(`emit FAILED ${msg}`)
+      })
     }
     if (!dryRun && useNtfy) sendNtfy(cfg, { ...meta, title }, body)
   }
@@ -714,6 +799,10 @@ export function apply(ctx, cliConfig = {}) {
       const id = session?.id
       if (id === undefined || id === null) return
 
+      if (event.type === 'turn/start' || event.type === 'turn/end' || event.type === 'goal/change') {
+        trace(`event ${event.type} session=${String(id).slice(0, 8)} turn=${event.data?.turn ?? '-'}`)
+      }
+
       /* ---- 会话标题：先缓存下来，任何通知都用得上（子会话也要） ---- */
       if (event.type === 'session/title') {
         const title = event.data?.title
@@ -735,6 +824,14 @@ export function apply(ctx, cliConfig = {}) {
       /* ---- 轮次 ---- */
       if (event.type === 'turn/start') {
         startedAt.set(id, event.time)
+        toolCounts.delete(`${id}\u0000${event.data?.turn ?? ''}`)
+        return
+      }
+
+      /* ---- 工具调用：只用来数次数（ask_user_question 上面已单独处理） ---- */
+      if (event.type === 'tool/call') {
+        const key = `${id}\u0000${event.data?.turn ?? ''}`
+        toolCounts.set(key, (toolCounts.get(key) ?? 0) + 1)
         return
       }
 
@@ -785,18 +882,30 @@ export function apply(ctx, cliConfig = {}) {
       const meta = KINDS[kind]
       if (meta === undefined) return
 
-      const stats = toolStats(session, event.data?.turn)
-      const label = sessionTitleOf(session, titleCache) || taskSnippet(session, event.data?.turn)
+      const turn = event.data?.turn
+      const turnKey = `${id}\u0000${turn ?? ''}`
+      const counted = toolCounts.get(turnKey) ?? 0
+      toolCounts.delete(turnKey)
+      const fromEvents = toolStats(session, turn)
+      const stats = { count: Math.max(counted, fromEvents.count), names: fromEvents.names }
+      trace(
+        `tools: counted=${counted} fromEvents=${fromEvents.count} eventsArray=` +
+          `${Array.isArray(session?.events) ? session.events.length : 'n/a'}`,
+      )
+      const label = sessionTitleOf(session, titleCache) || taskSnippet(session, turn)
 
       if (kind === 'completed') {
-        if (cfg.notifyOn === 'errors') return
+        if (cfg.notifyOn === 'errors') return trace('skip: notifyOn=errors')
         // 两个**客观**判据，都不依赖 agent 是否建了 goal：
         //   ① 这一轮干得够久（longTaskMs）  ② 这一轮动手够多（工具调用次数）
-        if (cfg.notifyOn !== 'all' && durationMs < cfg.longTaskMs && stats.count < cfg.minToolCalls) return
+        if (cfg.notifyOn !== 'all' && durationMs < cfg.longTaskMs && stats.count < cfg.minToolCalls) {
+          return trace(`skip: ${Math.round(durationMs / 1000)}s 且 ${stats.count} 次工具，都没到阈值`)
+        }
         // 只有"长任务轮次完成"这类可重复的通知才走去抖；目标完成 / 异常 / 审批一律立刻发
         const now = Date.now()
-        if (now - lastSentAt < cfg.debounceMs) return
+        if (now - lastSentAt < cfg.debounceMs) return trace(`skip: 去抖窗口内（${cfg.debounceMs}ms）`)
         lastSentAt = now
+        trace(`pass: ${Math.round(durationMs / 1000)}s / ${stats.count} 次工具 → 发通知`)
       }
 
       const lines = [...sessionLines(session, titleCache, taskSnippet(session, event.data?.turn))]
@@ -830,4 +939,5 @@ export function apply(ctx, cliConfig = {}) {
       ` · 去抖 ${cfg.debounceMs}ms` +
       `${cfg.cleanupOld && useMail ? ` · 旧通知自动清理(${cfg.mailTag})` : ''}${dryRun ? ' · dryrun' : ''}`,
   )
+  trace(`apply ready · debugTrace 已开，事件与发信结果都写进 _trace.log`)
 }

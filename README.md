@@ -26,7 +26,7 @@
 
 ## 特性
 
-- **邮件通知** —— 任意 SMTP 邮箱（QQ / 163 / Gmail / Outlook / 自建都行）。不需要 VPN、不需要装 App、不需要注册任何第三方服务
+- **邮件通知** —— 任意 SMTP 邮箱（QQ / 163 / Gmail / Outlook / 自建都行）。不需要 VPN、不需要装 App、不需要注册任何第三方服务；两种连接方式都支持（465 隐式 TLS / 587 STARTTLS），哪条通用哪条
 - **审批超时提醒** —— 权限审批挂起超过 60 秒（可配）就发一封，告诉你**是哪个会话、在等你批准什么操作、已经等了多久**
 - **提问超时提醒** —— agent 用 `ask_user_question` 问你一道选择题，超过 60 秒（可配）没回答就发一封，正文里带上**问题原文和候选项**，手机上不打开 GUI 也知道它在问什么
 - **多对话可分辨** —— 每条通知都带会话标题、会话号和工作区，**邮件主题里直接带一段会话标题**（40 字以内），并行跑几个任务时在手机邮件列表一眼看出是哪个
@@ -115,7 +115,8 @@ dsh plugin --profile web add github:<你的用户名>/dsh-mailbox-notify
   "channel": "mail",
   "mail": {
     "host": "smtp.qq.com",
-    "port": 465,
+    "port": 587,
+    "starttls": true,
     "user": "你的邮箱@qq.com",
     "pass": "你的SMTP授权码",
     "to": "你的邮箱@qq.com"
@@ -127,6 +128,17 @@ dsh plugin --profile web add github:<你的用户名>/dsh-mailbox-notify
   "link": "https://你的-dsh-地址/"
 }
 ```
+
+两组端口/加密方式，任选一组（不对就换另一组，代码两种都支持）：
+
+| 写法 | 连接方式 |
+|---|---|
+| `"port": 587, "starttls": true` | 明文连上再 STARTTLS 升级（**推荐**） |
+| `"port": 465, "starttls": false` | 连上立刻 TLS（隐式 TLS） |
+
+2026-10-12 实测：`smtp.qq.com:465` 直接 TLS 会报 `wrong version number`
+（465 端口回的是明文 220 问候语，同时 `smtp.163.com:465` 正常），而 587 + STARTTLS 一次通过。
+如果哪天又收不到通知，先用 `node test-mail.mjs` 单独测一下发信，能直接看出是通道问题还是任务本身不满足触发条件。
 
 `link` 填上你平时打开 dsh 的地址（比如 Tailscale 域名），邮件末尾就会多一行「处理：…」，在手机上点一下就能去点审批。
 
@@ -157,12 +169,14 @@ dsh plugin --profile web add github:<你的用户名>/dsh-mailbox-notify
 | `questionTimeoutMs` | `60000` | 提问（`ask_user_question`）挂起多久后提醒；设 `0` 关掉提问提醒 |
 | `questionIncludeSubagents` | `true` | 子代理的提问要不要也提醒 |
 | `link` | `""` | 邮件末尾附带回 dsh 的链接，留空则不附 |
+| `debugTrace` | `false` | `true` 时把"挂载 / 收到哪些事件 / 某轮为什么发或不发 / 发信结果"逐行写进包目录的 `_trace.log`，排查用 |
 | `mail.*` | — | SMTP 服务器、端口、账号、授权码、收件地址 |
+| `mail.starttls` | `false` | `true` = 明文连接后 STARTTLS（配 587）；`false` = 隐式 TLS（配 465） |
 | `imap.*` | `imap.qq.com:993` | 用来清理旧通知的 IMAP 服务器 |
 | `ntfy.topic` | `""` | 填了才启用 ntfy 通道 |
 | `timeoutMs` | `25000` | 网络操作超时 |
 
-也可以用环境变量覆盖：`DSH_NOTIFY_CHANNEL`、`DSH_NOTIFY_ON`、`DSH_NOTIFY_APPROVAL_MS`、`DSH_NOTIFY_QUESTION_MS`、`DSH_NOTIFY_LINK`、`DSH_NOTIFY_SMTP_HOST`、`DSH_NOTIFY_SMTP_USER`、`DSH_NOTIFY_SMTP_PASS`、`DSH_NOTIFY_MAIL_TO` 等（完整列表见源码 `resolveConfig`）。
+也可以用环境变量覆盖：`DSH_NOTIFY_CHANNEL`、`DSH_NOTIFY_ON`、`DSH_NOTIFY_APPROVAL_MS`、`DSH_NOTIFY_QUESTION_MS`、`DSH_NOTIFY_LINK`、`DSH_NOTIFY_SMTP_HOST`、`DSH_NOTIFY_SMTP_STARTTLS`、`DSH_NOTIFY_SMTP_USER`、`DSH_NOTIFY_SMTP_PASS`、`DSH_NOTIFY_MAIL_TO` 等（完整列表见源码 `resolveConfig`）。
 
 ## 通知长什么样
 
@@ -236,10 +250,19 @@ dsh 一个会话事件
 
 因为清理发生在发送之前，所以**任何时刻收件箱里最多只有一封** dsh 通知。
 
+> 「这一轮动手多不多」是插件在事件流里**自己数的**（累加 `tool/call`），不依赖会话对象上那个事件数组 ——
+> 2026-10-12 实测该数组在运行时是**空的**（`_trace.log` 里写着 `39s 且 0 次工具`，而那一轮实际调了 6 次），
+> 靠它统计会让"短任务但动手多"的通知彻底哑掉。会话标题同样优先取 `session/title` 事件缓存。
+
 ## 常见问题
 
 **收不到邮件？**
-先看 `dsh web` 的启动日志里有没有 `[dsh-mailbox-notify] 已启用`。有的话，检查是不是被邮箱判成垃圾邮件了（把发件人加白名单）。
+按这个顺序排，两步就能分清是"没触发"还是"发不出去"：
+
+1. `node test-mail.mjs` —— 单独测发信。**失败**就是通道问题（最常见的是端口/加密方式不对：`smtp.qq.com` 的 465 曾在 2026-10-12 起回明文问候语，导致 `wrong version number`，换 `587 + starttls: true` 即好）；**成功**说明通道没问题，进下一步
+2. 把 `debugTrace` 设成 `true`，重启 dsh，随便跑一轮任务，然后看包目录下的 `_trace.log`：它会写明这一轮算出来几次工具调用、为什么发或不发、发信成功还是失败
+
+另外确认 `dsh web` 的启动日志里有 `[dsh-mailbox-notify] 已启用`，并检查是不是被邮箱判成垃圾邮件了（把发件人加白名单）。
 
 **审批提醒为什么没来？**
 三个可能：① `approvalTimeoutMs` 设成了 0；② 你在 60 秒内已经点掉了（那就不该打扰你）；③ 那次请求根本不需要你点 —— 比如权限预设是「完全权限」，审批会自动通过，`approval/asked` 和 `approval/decided` 几乎同时写入，计时器立刻被取消。

@@ -1,6 +1,6 @@
 {
   "name": "dsh-mailbox-notify",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "DeepSeek Harness (dsh) 任务通知：任务跑完自动发邮件到你手机，审批卡住超过 1 分钟也会提醒你，并且每封新通知会自动删掉上一封（邮箱永不堆积）。零依赖、零构建、不监听端口。",
   "type": "module",
   "main": "index.js",

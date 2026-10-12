@@ -12,10 +12,12 @@
   "questionTimeoutMs": 60000,
   "questionIncludeSubagents": true,
   "link": "",
+  "debugTrace": false,
 
   "mail": {
     "host": "smtp.qq.com",
-    "port": 465,
+    "port": 587,
+    "starttls": true,
     "user": "你的邮箱@qq.com",
     "pass": "你的SMTP授权码（不是登录密码）",
     "to": "你的邮箱@qq.com"
