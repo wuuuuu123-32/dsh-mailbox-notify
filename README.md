@@ -94,17 +94,22 @@ tool/result  message.source.callId = call_xx…                ← 你答完了
 
 ## 安装
 
-```bash
-dsh plugin --profile web add dsh-mailbox-notify
-```
-
-装完重启 `dsh web`。
-
-从 GitHub 安装（开发版）：
+这个包**没有发布到 npm**，从 GitHub 装：
 
 ```bash
-dsh plugin --profile web add github:<你的用户名>/dsh-mailbox-notify
+dsh plugin --profile <你在用的 profile> add github:wuuuuu123-32/dsh-mailbox-notify
 ```
+
+`<你在用的 profile>` 一般是 `desktop`（桌面应用）或 `web`（`dsh web`）。装完**重启 dsh**
+（桌面版：托盘退出 `DeepSeek Harness` 再打开；`dsh web` 则是重启进程）。
+
+如果卡在 `git+ssh`，先跑一次：
+
+```bash
+git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+```
+
+本机开发时也可以直接链目录：`dsh plugin --profile <profile> add link:D:\path\to\dsh-mailbox-notify`。
 
 ## 配置
 
