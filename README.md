@@ -75,13 +75,23 @@ approval/decided  ← 用户真的点了（批准 / 拒绝 / 取消）
 
 ### 提问提醒是怎么判定的
 
-`ask_user_question` 在会话日志里是一对工具事件（2026-10-08 从真实日志里实测出来的字段）：
+`ask_user_question` 在会话日志里是一对工具事件。**标准模式**下长这样（2026-10-08 从真实日志实测的字段）：
 
 ```
 tool/call    name = "ask_user_question"   callId = call_xx…   ← 开始等你回答
       ……     你人在外面没看见，agent 就一直停在这里
 tool/result  message.source.callId = call_xx…                ← 你答完了
 ```
+
+**PTC 模式**（agent 只能把工具包在 `run_code` 里调）下换成另一对事件，字段名也不同：
+
+```
+tool/ptc-dispatch-start  name = "ask_user_question"  subCallId = call_xx…:ptc:1  ← 开始等你回答
+tool/ptc-dispatch        name = "ask_user_question"  subCallId = call_xx…:ptc:1  ← 你答完了
+```
+
+❗两种形态都认（2026-10-15 补的 PTC 分支）。PTC 模式下**不会**产生 `tool/call`，
+只监听它会让提问完全不计时 —— 这正是 v1.3.0 里提问提醒迟迟不响的原因。
 
 答案 JSON（`{"answers":[{"id":"route","selected":["…"]}]}`）就写在 `tool/result` 的正文里，
 时间差就是真实等待时长（现有会话里的实测样本：16s / 34s / 64s / 323s / 1883s）。
@@ -239,8 +249,10 @@ dsh 一个会话事件
       │        └─ approval/decided 到了？是 → 取消计时器，什么都不发
       │                       否 → 超时，发提醒
       │
-      ├─ tool/call = ask_user_question ─→ 起计时器（默认 60 秒）
-      │        └─ 配对的 tool/result 到了？是 → 取消计时器，什么都不发
+      ├─ 是「提问开始 / 结束」吗？ ─→ 起计时器（默认 60 秒）
+      │    直接调用：tool/call(name=ask_user_question) + data.callId
+      │    PTC 嵌套：tool/ptc-dispatch-start(name=ask_user_question) + data.subCallId
+      │        └─ 配对的结束事件到了？是 → 取消计时器，什么都不发
       │                       否 → 超时，发提醒（带问题原文和选项）
       │
       ├─ 是"值得打扰"的事件吗？  否 → 什么都不做
@@ -255,9 +267,13 @@ dsh 一个会话事件
 
 因为清理发生在发送之前，所以**任何时刻收件箱里最多只有一封** dsh 通知。
 
-> 「这一轮动手多不多」是插件在事件流里**自己数的**（累加 `tool/call`），不依赖会话对象上那个事件数组 ——
+> 「这一轮动手多不多」是插件在事件流里**自己数的**，不依赖会话对象上那个事件数组 ——
 > 2026-10-12 实测该数组在运行时是**空的**（`_trace.log` 里写着 `39s 且 0 次工具`，而那一轮实际调了 6 次），
 > 靠它统计会让"短任务但动手多"的通知彻底哑掉。会话标题同样优先取 `session/title` 事件缓存。
+>
+> 数的是哪些事件（2026-10-15 补）：标准模式数 `tool/call`；PTC 模式数内层的 `tool/ptc-dispatch-start`，
+> 而**跳过** `name === 'run_code'` 那一层（否则一轮永远只数到 1）。PTC 的这两个事件没有 `turn` 字段，
+> 插件用最近一次 `turn/start` 的轮号补上。
 
 ## 常见问题
 

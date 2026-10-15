@@ -148,5 +148,54 @@ fire(askChild, {
 })
 await sleep(3600)
 
+
+/* ------------------ 需求 4：PTC（run_code）模式下的同一批事件 ------------------ */
+// 2026-10-15 实测：agent 把工具包在 run_code 里调时，模型直接发起的 tool/call 只有 run_code，
+// 真正的调用是一对 tool/ptc-dispatch-start / tool/ptc-dispatch，且 data 里没有 turn 字段。
+
+const askPtc = { id: 's-ask-ptc', header: { cwd: 'D:\\dsh\\config' }, events: [] }
+fire(askPtc, { type: 'session/title', time: 1, data: { title: 'PTC 模式提问', messageSeqs: [1], source: { kind: 'fallback' } } })
+
+show('⑮ PTC 模式：提问挂起超过 40ms → 该推（认 tool/ptc-dispatch-start 的 subCallId）')
+fire(askPtc, {
+  type: 'tool/ptc-dispatch-start',
+  time: Date.now(),
+  data: {
+    rootCallId: 'call_root1',
+    parentCallId: 'call_root1',
+    subCallId: 'call_root1:ptc:1',
+    name: 'ask_user_question',
+    arguments: { questions: [{ id: 'x', header: '选一个', question: 'PTC 模式下这道题选哪个？', options: [{ label: '甲' }, { label: '乙' }] }] },
+  },
+})
+await sleep(3600)
+
+show('⑯ PTC 模式：提问立刻被回答（配对的 tool/ptc-dispatch）→ 不该推')
+fire(askPtc, {
+  type: 'tool/ptc-dispatch-start',
+  time: Date.now(),
+  data: { rootCallId: 'call_root2', parentCallId: 'call_root2', subCallId: 'call_root2:ptc:1', name: 'ask_user_question', arguments: { questions: [{ question: '马上就会被回答的问题' }] } },
+})
+fire(askPtc, {
+  type: 'tool/ptc-dispatch',
+  time: Date.now(),
+  data: { rootCallId: 'call_root2', parentCallId: 'call_root2', subCallId: 'call_root2:ptc:1', name: 'ask_user_question', arguments: {}, isError: false, content: [{ type: 'text', text: '{"answers":[{"id":"x","selected":["甲"]}]}' }] },
+})
+await sleep(200)
+console.log('（上面这一段没有输出 = 正确）')
+
+show('⑰ PTC 模式：一轮里只有 1 个 run_code + 5 次嵌套调用 → 该推【客观判据】')
+const ptcSession = { id: 's-ptc-tools', header: { cwd: 'D:\\dsh\\config' }, events: [] }
+fire(ptcSession, { type: 'turn/start', time: 300000, data: { turn: 1 } })
+fire(ptcSession, { type: 'tool/call', time: 300010, data: { turn: 1, step: 1, callId: 'call_root3', name: 'run_code', arguments: {} } })
+const innerNames = ['read', 'grep', 'write', 'edit', 'pwsh']
+for (let i = 0; i < innerNames.length; i++) {
+  const subCallId = `call_root3:ptc:${i + 1}`
+  fire(ptcSession, { type: 'tool/ptc-dispatch-start', time: 300011 + i, data: { rootCallId: 'call_root3', parentCallId: 'call_root3', subCallId, name: innerNames[i], arguments: {} } })
+  fire(ptcSession, { type: 'tool/ptc-dispatch', time: 300012 + i, data: { rootCallId: 'call_root3', parentCallId: 'call_root3', subCallId, name: innerNames[i], arguments: {}, isError: false, content: [] } })
+}
+fire(ptcSession, { type: 'turn/end', time: 300600, data: { turn: 1, reason: { kind: 'completed' } } })
+await sleep(500)
+
 console.log('\n=== 测试结束 ===')
 console.log('（去抖场景需要真实时间流逝，不在此测试中验证）')

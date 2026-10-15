@@ -20,9 +20,13 @@
  *   你人在外面没看见，它就干等着。等超过 questionTimeoutMs 还没回答的提问，
  *   会发一封提醒，正文里带上**问题原文和候选项**，手机上不用打开 GUI 也知道
  *   它想问什么，回去点一下就能继续。
- *   判据（2026-10-08 从真实会话日志里实测出来的）：
- *     - 开始等待：tool/call 且 data.name === 'ask_user_question'，取 data.callId
- *     - 用户作答：tool/result 且 data.message.source.callId === callId
+ *   判据（2026-10-08 从真实会话日志里实测出来的；2026-10-15 补 PTC 分支）：
+ *     - 直接调用  开始等待：tool/call 且 data.name === 'ask_user_question'，取 data.callId
+ *     - 直接调用  用户作答：tool/result 且 data.message.source.callId === callId
+ *     - PTC 嵌套  开始等待：tool/ptc-dispatch-start，data.name 同样是工具名，但调用号在 data.subCallId
+ *     - PTC 嵌套  用户作答：tool/ptc-dispatch（同一个 data.subCallId）
+ *       ❗agent 把工具包在 run_code 里调（PTC 模式）时**不会**产生 tool/call 事件，
+ *         只监听 tool/call 会让这类提问完全不计时（2026-10-15 实测踩到的失效根因）。
  *       （注意不是 data.toolCallId，那个字段在日志里是 undefined；答案 JSON
  *        就在 data.message.content[0].text 里，形如 {"answers":[...]}）
  *   两者时间差就是真实等待时长（实测样本 16s / 34s / 64s / 323s / 1883s）。
@@ -228,6 +232,9 @@ function clip(text, max = 90) {
 /**
  * 统计某一轮里的工具调用次数与工具名。
  * 事件结构：'tool/call': { turn, step, callId, name, arguments }
+ *   （❗PTC 模式下模型只直接发 run_code，这一层 tool/call 的名字就全是 run_code）
+ * 嵌套调用：'tool/ptc-dispatch-start' / 'tool/ptc-dispatch'：
+ *   { rootCallId, parentCallId, subCallId, name, arguments }  —— 没有 turn 字段
  * 这是"这一轮到底干了多少活"最客观的判据 —— 不依赖 agent 有没有建 goal。
  * @param session - 会话对象（含 events 数组）
  * @param turn - 轮次编号
@@ -241,7 +248,10 @@ function toolStats(session, turn) {
   for (const e of events) {
     if (e?.type === 'turn/start' && e?.data?.turn === turn) { inTurn = true; continue }
     if (e?.type === 'turn/end' && e?.data?.turn === turn) break
-    if (inTurn && e?.type === 'tool/call' && typeof e.data?.name === 'string') names.push(e.data.name)
+    const isDispatch = e?.type === 'tool/call' || e?.type === 'tool/ptc-dispatch-start'
+    if (inTurn && isDispatch && typeof e.data?.name === 'string' && e.data.name !== 'run_code') {
+      names.push(e.data.name)
+    }
   }
   return { count: names.length, names }
 }
@@ -544,6 +554,7 @@ export function apply(ctx, cliConfig = {}) {
    * 写着 "39s 且 0 次工具"，而那一轮实际调了 6 次），所以改成从 session/event 流里累加。
    */
   const toolCounts = new Map()
+  const currentTurn = new Map() // PTC 事件没有 turn，用当前轮号补
   /** Map<sessionId, title>：session/title 事件随手缓存，通知时直接取。 */
   const titleCache = new Map()
   /** Map<"sessionId\0requestId", entry>：正在等用户点的那几个审批。 */
@@ -818,19 +829,43 @@ export function apply(ctx, cliConfig = {}) {
       if (event.type === 'tool/call' && event.data?.name === 'ask_user_question') onQuestionAsked(session, event)
       if (event.type === 'tool/result') onQuestionAnswered(session, event)
 
+      /* PTC 模式（agent 只能把工具调用包在 run_code 里）下发生的是同一件事，但事件名与字段都不同：
+         - 开始等待：tool/ptc-dispatch-start，工具名仍在 data.name，调用号在 data.subCallId（不是 callId）
+         - 完成：tool/ptc-dispatch，带同一个 data.subCallId 以及 content / isError
+         2026-10-15 实测：run_code 里嵌套调用工具只产生 tool/ptc-dispatch-start / tool/ptc-dispatch，
+         会话日志里没有对应的 tool/call —— 只认 tool/call 会让"包在 run_code 里的提问"永远不计时、
+         不提醒（这就是提问超时提醒失效的根因）。这里把两种形态归一成 onQuestionAsked / onQuestionAnswered
+         期待的形状，复用同一套计时逻辑。 */
+      if (event.type === 'tool/ptc-dispatch-start' && event.data?.name === 'ask_user_question') {
+        onQuestionAsked(session, { ...event, data: { ...event.data, callId: event.data.subCallId } })
+      }
+      if (event.type === 'tool/ptc-dispatch' && event.data?.name === 'ask_user_question') {
+        onQuestionAnswered(session, { ...event, data: { message: { source: { callId: event.data.subCallId } } } })
+      }
+
       // 子代理 / fork 出来的会话，除上面几类之外的事件都不进通知
       if (isChildSession(session)) return
 
       /* ---- 轮次 ---- */
       if (event.type === 'turn/start') {
         startedAt.set(id, event.time)
+        currentTurn.set(id, event.data?.turn ?? '')
         toolCounts.delete(`${id}\u0000${event.data?.turn ?? ''}`)
         return
       }
 
-      /* ---- 工具调用：只用来数次数（ask_user_question 上面已单独处理） ---- */
-      if (event.type === 'tool/call') {
+      /* ---- 工具调用：只用来数次数（ask_user_question 上面已单独处理） ----
+         ❗PTC 模式下模型直接发起的 tool/call 只有 run_code 一个，真正干的活全在内层：
+         每次嵌套调用是一对 tool/ptc-dispatch-start / tool/ptc-dispatch，而这两个事件的 data
+         里没有 turn（实测只有 rootCallId / parentCallId / subCallId / name / arguments），
+         所以用当前轮号补；run_code 本身不算次数，否则"这一轮动手多不多"永远只数到 0~1。 */
+      if (event.type === 'tool/call' && event.data?.name !== 'run_code') {
         const key = `${id}\u0000${event.data?.turn ?? ''}`
+        toolCounts.set(key, (toolCounts.get(key) ?? 0) + 1)
+        return
+      }
+      if (event.type === 'tool/ptc-dispatch-start') {
+        const key = `${id}\u0000${event.data?.turn ?? currentTurn.get(id) ?? ''}`
         toolCounts.set(key, (toolCounts.get(key) ?? 0) + 1)
         return
       }
