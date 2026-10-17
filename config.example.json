@@ -13,6 +13,7 @@
   "questionIncludeSubagents": true,
   "link": "",
   "debugTrace": false,
+  "mailTimeoutMs": 15000,
 
   "mail": {
     "host": "smtp.qq.com",

@@ -21,7 +21,7 @@
 所以这个插件做了三件事：
 
 1. 任务结束时给你发邮件
-2. **每次发新通知前，自动把上一封删掉** —— 邮箱里永远最多只有一封
+2. **每次发新通知前，自动清理收件箱里的旧通知** —— 仅扫描收件箱（INBOX）
 3. **审批 / 提问卡住时单独提醒你** —— agent 弹出权限确认、或者弹出一道选择题问你，没人回应它就一直停在那儿，这种"最需要你介入"的时刻必须能被推到手机上
 
 ## 特性
@@ -177,7 +177,7 @@ git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 | `longTaskMs` | `180000` | 超过这个毫秒数的轮次算"正经干活"，也会通知 |
 | `minToolCalls` | `5` | 一轮里工具调用达到这个次数也会通知（不依赖 goal） |
 | `debounceMs` | `60000` | 同类成功通知的最小间隔，防止刷屏 |
-| `cleanupOld` | `true` | 发新通知前删掉旧的同前缀通知 |
+| `cleanupOld` | `true` | 发新通知前只在收件箱（INBOX）里删除旧的同前缀通知；其他文件夹不会扫描 |
 | `mailTag` | `"[dsh-notify]"` | 通知邮件的主题前缀，IMAP 靠它识别自己的邮件 |
 | `approvalTimeoutMs` | `60000` | 审批挂起多久后提醒；设 `0` 关掉审批提醒 |
 | `approvalIncludeSubagents` | `true` | 子代理的审批要不要也提醒 |
@@ -185,11 +185,12 @@ git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
 | `questionIncludeSubagents` | `true` | 子代理的提问要不要也提醒 |
 | `link` | `""` | 邮件末尾附带回 dsh 的链接，留空则不附 |
 | `debugTrace` | `false` | `true` 时把"挂载 / 收到哪些事件 / 某轮为什么发或不发 / 发信结果"逐行写进包目录的 `_trace.log`，排查用 |
+| `mailTimeoutMs` | `15000` | IMAP / SMTP 的连接、问候语和服务器响应超时（毫秒） |
 | `mail.*` | — | SMTP 服务器、端口、账号、授权码、收件地址 |
 | `mail.starttls` | `false` | `true` = 明文连接后 STARTTLS（配 587）；`false` = 隐式 TLS（配 465） |
 | `imap.*` | `imap.qq.com:993` | 用来清理旧通知的 IMAP 服务器 |
 | `ntfy.topic` | `""` | 填了才启用 ntfy 通道 |
-| `timeoutMs` | `25000` | 网络操作超时 |
+| `timeoutMs` | `25000` | 旧版邮件超时配置；未设置 `mailTimeoutMs` 时仍作为兼容回退 |
 
 也可以用环境变量覆盖：`DSH_NOTIFY_CHANNEL`、`DSH_NOTIFY_ON`、`DSH_NOTIFY_APPROVAL_MS`、`DSH_NOTIFY_QUESTION_MS`、`DSH_NOTIFY_LINK`、`DSH_NOTIFY_SMTP_HOST`、`DSH_NOTIFY_SMTP_STARTTLS`、`DSH_NOTIFY_SMTP_USER`、`DSH_NOTIFY_SMTP_PASS`、`DSH_NOTIFY_MAIL_TO` 等（完整列表见源码 `resolveConfig`）。
 
@@ -265,7 +266,7 @@ dsh 一个会话事件
    SMTP 用你的邮箱给自己发一封新通知
 ```
 
-因为清理发生在发送之前，所以**任何时刻收件箱里最多只有一封** dsh 通知。
+每次发送前，自动清理只搜索 `INBOX` 并删除主题带 `mailTag` 前缀的旧通知；其他文件夹不会扫描。并发发送或 IMAP 同步延迟时，收件箱中可能暂时存在多封通知。
 
 > 「这一轮动手多不多」是插件在事件流里**自己数的**，不依赖会话对象上那个事件数组 ——
 > 2026-10-12 实测该数组在运行时是**空的**（`_trace.log` 里写着 `39s 且 0 次工具`，而那一轮实际调了 6 次），

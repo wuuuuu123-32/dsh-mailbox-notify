@@ -42,8 +42,8 @@
  *   'both'  两个都发
  *
  * 邮件"阅后即焚"（cleanupOld）：通知邮件主题统一带 [dsh] 前缀，
- * 每次发新通知前先通过 IMAP 把上一封带该前缀的邮件删掉，
- * 这样邮箱里永远最多只有一封通知，不会堆积。只删带前缀的邮件。
+ * 每次发新通知前先通过 IMAP 在 INBOX 把上一封带该前缀的邮件删掉，
+ * 这样收件箱里不会堆积旧通知。只删带前缀的邮件。
  *
  * 零第三方依赖：SMTP / IMAP 用 node:tls 手写，ntfy 用 Node 自带的 fetch。
  * 不监听任何端口、不写任何文件（只读同目录的 config.json）。
@@ -66,7 +66,7 @@ const DEFAULTS = {
   longTaskMs: 180000, // 判据①：耗时超过这个数（默认 3 分钟）算"正经干活"
   minToolCalls: 5, // 判据②：一轮里工具调用 ≥ 这个数（默认 5 次）也算 —— **不依赖 agent 建 goal**
   debounceMs: 60000, // 连续成功通知的合并窗口，防止刷屏
-  cleanupOld: true, // 发新通知前删掉旧的同前缀通知（邮箱不堆积）
+  cleanupOld: true, // 发新通知前删掉收件箱里旧的同前缀通知
   mailTag: '[dsh-notify]', // 通知邮件的主题前缀，IMAP 靠它识别"自己的邮件"
   approvalTimeoutMs: 60000, // 审批挂起超过这个时间就提醒；0 = 关掉审批提醒
   approvalIncludeSubagents: true, // 子代理的审批同样会卡住整个任务，默认一并提醒
@@ -85,6 +85,7 @@ const DEFAULTS = {
   imap: { host: 'imap.qq.com', port: 993 },
   ntfy: { topic: '', server: 'https://ntfy.sh' },
   timeoutMs: 25000,
+  mailTimeoutMs: 15000,
 }
 
 /** 同时超时的多个审批合并进同一封邮件的等待窗口。 */
@@ -179,6 +180,10 @@ function resolveConfig(cliConfig = {}) {
     link: String(pick(env.DSH_NOTIFY_LINK, cliConfig.link, file.link, DEFAULTS.link)),
     debugTrace: toBool(pick(env.DSH_NOTIFY_DEBUG_TRACE, cliConfig.debugTrace, file.debugTrace), DEFAULTS.debugTrace),
     timeoutMs: toInt(pick(env.DSH_NOTIFY_TIMEOUT_MS, file.timeoutMs), DEFAULTS.timeoutMs),
+    mailTimeoutMs: toInt(
+      pick(env.DSH_NOTIFY_MAIL_TIMEOUT_MS, cliConfig.mailTimeoutMs, file.mailTimeoutMs, env.DSH_NOTIFY_TIMEOUT_MS, file.timeoutMs),
+      DEFAULTS.mailTimeoutMs,
+    ),
     mail: {
       host: String(pick(env.DSH_NOTIFY_SMTP_HOST, mail.host, DEFAULTS.mail.host)),
       port: toInt(pick(mail.port, DEFAULTS.mail.port), DEFAULTS.mail.port),
@@ -336,9 +341,17 @@ function connectTls(host, port, timeoutMs) {
   const socket = tls.connect({ host, port, servername: host })
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { socket.destroy(); reject(new Error('连接超时')) }, timeoutMs)
-    socket.once('secureConnect', () => { clearTimeout(timer); resolve(socket) })
+    socket.once('secureConnect', () => {
+      clearTimeout(timer)
+      setSocketTimeout(socket, timeoutMs)
+      resolve(socket)
+    })
     socket.once('error', error => { clearTimeout(timer); reject(error) })
   })
+}
+
+function setSocketTimeout(socket, timeoutMs) {
+  socket.setTimeout(timeoutMs, () => socket.destroy(new Error('服务器响应超时')))
 }
 
 /** SMTP 读取器：累积到「三位数字 + 空格」结尾的那一行才算完整响应。 */
@@ -358,12 +371,20 @@ function makeSmtpReader(socket) {
         acc = []
         const done = waiter
         waiter = null
-        done(text)
+        done.resolve(text)
       }
     }
   }
   socket.on('data', chunk => { pending += chunk.toString('utf8'); pump() })
-  return () => new Promise(resolve => { waiter = resolve; pump() })
+  const fail = error => {
+    if (!waiter) return
+    const done = waiter
+    waiter = null
+    done.reject(error)
+  }
+  socket.on('error', fail)
+  socket.on('close', () => fail(new Error('SMTP 连接已关闭')))
+  return () => new Promise((resolve, reject) => { waiter = { resolve, reject }; pump() })
 }
 
 /** IMAP 读取器：等到出现以指定 tag 开头的行，把这一批响应行一起交出去。 */
@@ -388,7 +409,15 @@ function makeImapReader(socket) {
     }
   }
   socket.on('data', chunk => { pending += chunk.toString('utf8'); pump() })
-  return tag => new Promise(resolve => { waiter = { tag, resolve }; pump() })
+  const fail = error => {
+    if (!waiter) return
+    const done = waiter
+    waiter = null
+    done.reject(error)
+  }
+  socket.on('error', fail)
+  socket.on('close', () => fail(new Error('IMAP 连接已关闭')))
+  return tag => new Promise((resolve, reject) => { waiter = { tag, resolve, reject }; pump() })
 }
 
 /** 明文 TCP 连接（STARTTLS 的第一段）。 */
@@ -396,7 +425,11 @@ function connectPlain(host, port, timeoutMs) {
   const socket = net.connect({ host, port })
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => { socket.destroy(); reject(new Error('连接超时')) }, timeoutMs)
-    socket.once('connect', () => { clearTimeout(timer); resolve(socket) })
+    socket.once('connect', () => {
+      clearTimeout(timer)
+      setSocketTimeout(socket, timeoutMs)
+      resolve(socket)
+    })
     socket.once('error', error => { clearTimeout(timer); reject(error) })
   })
 }
@@ -425,7 +458,11 @@ async function connectStarttls(host, port, timeoutMs) {
   return await new Promise((resolve, reject) => {
     const socket = tls.connect({ socket: raw, servername: host })
     const timer = setTimeout(() => { socket.destroy(); reject(new Error('TLS 握手超时')) }, timeoutMs)
-    socket.once('secureConnect', () => { clearTimeout(timer); resolve(socket) })
+    socket.once('secureConnect', () => {
+      clearTimeout(timer)
+      setSocketTimeout(socket, timeoutMs)
+      resolve(socket)
+    })
     socket.once('error', error => { clearTimeout(timer); reject(error) })
   })
 }
@@ -435,10 +472,11 @@ async function connectStarttls(host, port, timeoutMs) {
 export async function sendMail(cfg, subject, text) {
   if (!cfg.host || !cfg.user || !cfg.pass || !cfg.to) throw new Error('邮件配置不完整')
 
+  const timeoutMs = cfg.mailTimeoutMs ?? cfg.timeoutMs ?? DEFAULTS.mailTimeoutMs
   const useStarttls = cfg.starttls === true
   const socket = useStarttls
-    ? await connectStarttls(cfg.host, cfg.port, cfg.timeoutMs)
-    : await connectTls(cfg.host, cfg.port, cfg.timeoutMs)
+    ? await connectStarttls(cfg.host, cfg.port, timeoutMs)
+    : await connectTls(cfg.host, cfg.port, timeoutMs)
   const read = makeSmtpReader(socket)
   const expect = async code => {
     const raw = await read()
@@ -491,7 +529,8 @@ export async function sendMail(cfg, subject, text) {
 export async function dropOldMails(cfg) {
   if (!cfg.imap.host || !cfg.mail.user || !cfg.mail.pass) return 0
 
-  const socket = await connectTls(cfg.imap.host, cfg.imap.port, cfg.timeoutMs)
+  const timeoutMs = cfg.mailTimeoutMs ?? cfg.timeoutMs ?? DEFAULTS.mailTimeoutMs
+  const socket = await connectTls(cfg.imap.host, cfg.imap.port, timeoutMs)
   const wait = makeImapReader(socket)
   const say = line => socket.write(`${line}\r\n`)
 
@@ -581,7 +620,7 @@ export function apply(ctx, cliConfig = {}) {
     // 前缀留明文（IMAP 靠它搜索），标题本体按 RFC 2047 编码，避免邮件头出现裸非 ASCII
     trace(`sendMail → ${cfg.mail.host}:${cfg.mail.port} (starttls=${cfg.mail.starttls}) title=${meta.title}`)
     try {
-      await sendMail({ ...cfg.mail, timeoutMs: cfg.timeoutMs }, `${cfg.mailTag} ${headerText(meta.title)}`, body)
+      await sendMail({ ...cfg.mail, mailTimeoutMs: cfg.mailTimeoutMs }, `${cfg.mailTag} ${headerText(meta.title)}`, body)
       trace(`sendMail OK`)
       console.log(`[dsh-notify] 邮件已发送 → ${cfg.mail.to}`)
     } catch (error) {
